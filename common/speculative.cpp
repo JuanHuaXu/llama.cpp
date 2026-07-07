@@ -1313,8 +1313,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        const bool dump_draft_rows = !this->params.mtp_train_dump.empty() && this->params.mtp_train_dump_source == "draft";
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !dump_draft_rows);
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
@@ -1408,8 +1409,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        SPC_INF("MTP training dump enabled: path='%s', n_embd=%d, format=q8_row_scale, limit=%" PRIu64 "\n",
-                params.mtp_train_dump.c_str(), n_embd, params.mtp_train_dump_limit);
+        SPC_INF("MTP training dump enabled: path='%s', source=%s, n_embd=%d, format=q8_row_scale, limit=%" PRIu64 "\n",
+                params.mtp_train_dump.c_str(), params.mtp_train_dump_source.c_str(), n_embd, params.mtp_train_dump_limit);
     }
 
     void finish_mtp_train_dump_if_needed() {
@@ -1472,7 +1473,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         finish_mtp_train_dump_if_needed();
     }
 
-    void dump_mtp_train_rows(const llama_batch & batch_in, llama_seq_id seq_id, int32_t i_beg, int32_t n_rows) {
+    void dump_mtp_train_rows_target(const llama_batch & batch_in, llama_seq_id seq_id, int32_t i_beg, int32_t n_rows) {
         if (!mtp_dump.is_open() || mtp_dump_finished || n_rows < 4) {
             return;
         }
@@ -1485,6 +1486,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 batch_in.token[k + 3],
             };
             const float * h = verify_h[seq_id].data() + (size_t) i * n_embd;
+            write_mtp_train_record(seq_id, batch_in.pos[k], batch_in.token[k], labels, h);
+        }
+    }
+
+    void dump_mtp_train_rows_draft(const llama_batch & batch_in, llama_seq_id seq_id, int32_t i_beg, int32_t n_rows) {
+        if (!mtp_dump.is_open() || mtp_dump_finished || n_rows < 4) {
+            return;
+        }
+
+        auto * ctx_dft = params.ctx_dft;
+        if (ctx_dft == nullptr) {
+            return;
+        }
+
+        for (int32_t i = 0; i + 3 < n_rows; ++i) {
+            const int32_t k = i_beg + i;
+            const llama_token labels[3] = {
+                batch_in.token[k + 1],
+                batch_in.token[k + 2],
+                batch_in.token[k + 3],
+            };
+            const float * h = llama_get_embeddings_nextn_ith(ctx_dft, k);
             write_mtp_train_record(seq_id, batch_in.pos[k], batch_in.token[k], labels, h);
         }
     }
@@ -1621,7 +1644,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
 
-            dump_mtp_train_rows(batch_in, seq_id, i_batch_beg[seq_id], n_rows);
+            if (params.mtp_train_dump_source == "draft") {
+                dump_mtp_train_rows_draft(batch_in, seq_id, i_batch_beg[seq_id], n_rows);
+            } else {
+                dump_mtp_train_rows_target(batch_in, seq_id, i_batch_beg[seq_id], n_rows);
+            }
         }
 
         return true;

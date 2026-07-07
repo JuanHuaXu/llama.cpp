@@ -3746,6 +3746,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_DUMP_LIMIT"));
     add_opt(common_arg(
+        {"--spec-mtp-dump-source"}, "target|draft",
+        "hidden row source for --spec-mtp-dump: target=main model seed hidden, draft=post-MTP hidden (default: target)",
+        [](common_params & params, const std::string & value) {
+            if (value != "target" && value != "draft") {
+                throw std::invalid_argument("--spec-mtp-dump-source must be target or draft");
+            }
+            params.speculative.draft.mtp_train_dump_source = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_DUMP_SOURCE"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
         "use --list-devices to see a list of available devices",

@@ -97,8 +97,9 @@ def load_norm_weight(reader, n_embd, device):
 
 
 class LowRankHead(nn.Module):
-    def __init__(self, n_embd, rank, norm_weight):
+    def __init__(self, n_embd, rank, norm_weight, input_normalized):
         super().__init__()
+        self.input_normalized = input_normalized
         self.register_buffer("norm_weight", norm_weight.float().clone())
         self.down = nn.Linear(n_embd, rank, bias=False)
         self.up = nn.Linear(rank, n_embd, bias=False)
@@ -108,8 +109,11 @@ class LowRankHead(nn.Module):
 
     def forward(self, h):
         h = h.float()
-        rms = torch.rsqrt(torch.mean(h * h, dim=-1, keepdim=True) + 1e-6)
-        z = h * rms * self.norm_weight
+        if self.input_normalized:
+            z = h
+        else:
+            rms = torch.rsqrt(torch.mean(h * h, dim=-1, keepdim=True) + 1e-6)
+            z = h * rms * self.norm_weight
         z = z + self.up(self.down(z)) * self.scale
         return z
 
@@ -159,6 +163,7 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--eval-batches", type=int, default=32)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--input-normalized", action="store_true", help="treat dumped rows as already normalized for the shared output head")
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
 
@@ -172,7 +177,7 @@ def main():
 
     output_weight = load_output_weight(reader, args.output_cache, device)
     norm_weight = load_norm_weight(reader, header["n_embd"], device)
-    model = LowRankHead(header["n_embd"], args.rank, norm_weight).to(device=device, dtype=torch.float32)
+    model = LowRankHead(header["n_embd"], args.rank, norm_weight, args.input_normalized).to(device=device, dtype=torch.float32)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     rng = np.random.default_rng(args.seed)
 
@@ -188,6 +193,7 @@ def main():
                 "batch_size": args.batch_size,
                 "steps": args.steps,
                 "device": str(device),
+                "input_normalized": bool(args.input_normalized),
             }
         ),
         flush=True,
