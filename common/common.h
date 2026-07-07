@@ -330,6 +330,9 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    std::string mtp_train_dump; // path to write draft-MTP training records
+    uint64_t mtp_train_dump_limit = 0; // maximum records to dump (0 = unlimited)
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <cmath>
+#include <fstream>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -1249,6 +1251,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<mtp_cap_score> cap_scores;
     std::vector<int32_t> active_cap;
     std::vector<int64_t> active_start_us;
+    std::ofstream mtp_dump;
+    std::vector<int8_t> mtp_dump_q8;
+    uint64_t mtp_dump_records  = 0;
+    bool     mtp_dump_finished = false;
     uint32_t accept_updates      = 0;
     int32_t  n_max_adaptive_last = -1;
     int32_t  next_probe_cap      = 1;
@@ -1335,6 +1341,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        init_mtp_train_dump();
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1354,7 +1362,131 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             free(batch.token);
             batch.token = nullptr;
         }
+        if (mtp_dump.is_open()) {
+            mtp_dump.close();
+        }
         llama_batch_free(batch);
+    }
+
+    template <typename T>
+    void mtp_dump_write_scalar(const T & value) {
+        mtp_dump.write(reinterpret_cast<const char *>(&value), sizeof(value));
+    }
+
+    void init_mtp_train_dump() {
+        if (params.mtp_train_dump.empty()) {
+            return;
+        }
+
+        mtp_dump.open(params.mtp_train_dump, std::ios::binary | std::ios::trunc);
+        if (!mtp_dump.is_open()) {
+            SPC_WRN("failed to open MTP training dump '%s'\n", params.mtp_train_dump.c_str());
+            mtp_dump_finished = true;
+            return;
+        }
+
+        mtp_dump_q8.resize((size_t) n_embd);
+
+        const char magic[8] = { 'M', 'T', 'P', 'D', 'M', 'P', '1', '\0' };
+        const uint32_t version             = 1;
+        const uint32_t format_q8_row_scale = 1;
+        const uint32_t n_labels            = 3;
+        const uint32_t record_meta_bytes   = 28; // seq_id, pos, token, 3 labels, f32 scale
+
+        mtp_dump.write(magic, sizeof(magic));
+        mtp_dump_write_scalar(version);
+        mtp_dump_write_scalar((uint32_t) n_embd);
+        mtp_dump_write_scalar(n_labels);
+        mtp_dump_write_scalar(format_q8_row_scale);
+        mtp_dump_write_scalar(record_meta_bytes);
+        mtp_dump_write_scalar(params.mtp_train_dump_limit);
+
+        if (!mtp_dump.good()) {
+            SPC_WRN("failed to write MTP training dump header '%s'\n", params.mtp_train_dump.c_str());
+            mtp_dump.close();
+            mtp_dump_finished = true;
+            return;
+        }
+
+        SPC_INF("MTP training dump enabled: path='%s', n_embd=%d, format=q8_row_scale, limit=%" PRIu64 "\n",
+                params.mtp_train_dump.c_str(), n_embd, params.mtp_train_dump_limit);
+    }
+
+    void finish_mtp_train_dump_if_needed() {
+        if (!mtp_dump.is_open() || mtp_dump_finished) {
+            return;
+        }
+        if (params.mtp_train_dump_limit > 0 && mtp_dump_records >= params.mtp_train_dump_limit) {
+            SPC_INF("MTP training dump reached limit: records=%" PRIu64 ", path='%s'\n",
+                    mtp_dump_records, params.mtp_train_dump.c_str());
+            mtp_dump.close();
+            mtp_dump_finished = true;
+        }
+    }
+
+    void write_mtp_train_record(
+            llama_seq_id seq_id,
+            llama_pos pos,
+            llama_token token,
+            const llama_token labels[3],
+            const float * h) {
+        if (!mtp_dump.is_open() || mtp_dump_finished) {
+            return;
+        }
+
+        finish_mtp_train_dump_if_needed();
+        if (!mtp_dump.is_open()) {
+            return;
+        }
+
+        float max_abs = 0.0f;
+        for (int32_t i = 0; i < n_embd; ++i) {
+            max_abs = std::max(max_abs, std::fabs(h[i]));
+        }
+
+        const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+        for (int32_t i = 0; i < n_embd; ++i) {
+            const float scaled = h[i] / scale;
+            const int q = std::max(-127, std::min(127, (int) std::lround(scaled)));
+            mtp_dump_q8[i] = (int8_t) q;
+        }
+
+        mtp_dump_write_scalar((int32_t) seq_id);
+        mtp_dump_write_scalar((int32_t) pos);
+        mtp_dump_write_scalar((int32_t) token);
+        mtp_dump_write_scalar((int32_t) labels[0]);
+        mtp_dump_write_scalar((int32_t) labels[1]);
+        mtp_dump_write_scalar((int32_t) labels[2]);
+        mtp_dump_write_scalar(scale);
+        mtp_dump.write(reinterpret_cast<const char *>(mtp_dump_q8.data()), mtp_dump_q8.size());
+
+        if (!mtp_dump.good()) {
+            SPC_WRN("failed while writing MTP training dump '%s' after %" PRIu64 " records\n",
+                    params.mtp_train_dump.c_str(), mtp_dump_records);
+            mtp_dump.close();
+            mtp_dump_finished = true;
+            return;
+        }
+
+        ++mtp_dump_records;
+        finish_mtp_train_dump_if_needed();
+    }
+
+    void dump_mtp_train_rows(const llama_batch & batch_in, llama_seq_id seq_id, int32_t i_beg, int32_t n_rows) {
+        if (!mtp_dump.is_open() || mtp_dump_finished || n_rows < 4) {
+            return;
+        }
+
+        for (int32_t i = 0; i + 3 < n_rows; ++i) {
+            const int32_t k = i_beg + i;
+            const llama_token labels[3] = {
+                batch_in.token[k + 1],
+                batch_in.token[k + 2],
+                batch_in.token[k + 3],
+            };
+            const float * h = verify_h[seq_id].data() + (size_t) i * n_embd;
+            write_mtp_train_record(seq_id, batch_in.pos[k], batch_in.token[k], labels, h);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1488,6 +1620,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+
+            dump_mtp_train_rows(batch_in, seq_id, i_batch_beg[seq_id], n_rows);
         }
 
         return true;
