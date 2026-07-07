@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <cstdint>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -591,12 +592,31 @@ struct server_prompt_data {
     }
 };
 
+struct server_prompt_stats {
+    uint64_t tick_created = 0;
+    uint64_t tick_stored  = 0;
+    uint64_t tick_seen    = 0;
+    uint64_t tick_hit     = 0;
+
+    uint64_t n_seen         = 0;
+    uint64_t n_hit          = 0;
+    uint64_t n_tokens_saved = 0;
+    uint64_t n_best_lcp     = 0;
+
+    uint64_t tokens_hash = 0;
+    size_t tokens_size   = 0;
+
+    double score(size_t bytes, size_t tokens, uint64_t tick_now) const;
+};
+
 struct server_prompt {
     server_tokens tokens;
 
     server_prompt_data data;
 
     std::list<common_prompt_checkpoint> checkpoints;
+
+    server_prompt_stats stats;
 
     size_t size() const {
         size_t res = 0;
@@ -619,6 +639,7 @@ struct server_prompt {
             tokens.clone(),
             data,
             checkpoints,
+            stats,
         };
     }
 };
@@ -630,6 +651,8 @@ struct server_prompt_cache {
     }
 
     std::list<server_prompt> states;
+
+    uint64_t stats_tick = 0;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;

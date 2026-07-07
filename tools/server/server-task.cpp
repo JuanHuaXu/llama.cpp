@@ -10,6 +10,9 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
+#include <cmath>
+
 using json = nlohmann::ordered_json;
 
 //
@@ -1600,6 +1603,55 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+
+static uint64_t server_prompt_tokens_hash(const server_tokens & tokens) {
+    constexpr uint64_t fnv_offset = 14695981039346656037ull;
+    constexpr uint64_t fnv_prime  = 1099511628211ull;
+
+    uint64_t hash = fnv_offset;
+
+    auto mix_byte = [&](uint8_t byte) {
+        hash ^= byte;
+        hash *= fnv_prime;
+    };
+
+    auto mix_u64 = [&](uint64_t value) {
+        for (int i = 0; i < 8; ++i) {
+            mix_byte(uint8_t((value >> (8*i)) & 0xff));
+        }
+    };
+
+    mix_u64(tokens.size());
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const llama_token tok = tokens[i];
+        mix_u64(uint64_t(uint32_t(tok)));
+
+        if (tokens.has_mtmd && tok == LLAMA_TOKEN_NULL) {
+            const auto & chunk = tokens.find_chunk(i);
+            if (chunk) {
+                const std::string id = mtmd_input_chunk_get_id(chunk.get());
+                mix_u64(id.size());
+                for (const unsigned char c : id) {
+                    mix_byte(c);
+                }
+                mix_u64(mtmd_input_chunk_get_n_tokens(chunk.get()));
+            }
+        }
+    }
+
+    return hash;
+}
+
+double server_prompt_stats::score(size_t bytes, size_t tokens, uint64_t tick_now) const {
+    const double size_mib = std::max(1.0, double(bytes) / (1024.0 * 1024.0));
+    const double hit_rate = n_seen > 0 ? double(n_hit) / double(n_seen) : 0.0;
+    const double avg_saved = n_hit > 0 ? double(n_tokens_saved) / double(n_hit) : double(tokens) * 0.10;
+    const double recency = 1.0 / (1.0 + double(tick_now - std::max(tick_hit, tick_stored)) / 8.0);
+
+    return ((0.25 + hit_rate) * avg_saved * (1.0 + std::log1p(double(n_hit))) * recency) / size_mib;
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1663,6 +1715,19 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         return nullptr;
     }
 
+    const uint64_t tokens_hash = server_prompt_tokens_hash(prompt.tokens);
+    server_prompt_stats stats = prompt.stats;
+    if (stats.tokens_hash != tokens_hash || stats.tokens_size != prompt.tokens.size()) {
+        stats = {};
+        stats.tokens_hash = tokens_hash;
+        stats.tokens_size = prompt.tokens.size();
+    }
+
+    stats.tick_stored = ++stats_tick;
+    if (stats.tick_created == 0) {
+        stats.tick_created = stats.tick_stored;
+    }
+
     states.push_back({
         /*.tokens      =*/ prompt.tokens.clone(),
         /*.data        =*/ {
@@ -1670,24 +1735,32 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
             /*.drft =*/ std::move(state_data_dft),
         },
         /*.checkpoints =*/ prompt.checkpoints,
+        /*.stats       =*/ stats,
     });
 
     return &states.back();
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    const int lcp_best_base = prompt.tokens.get_common_prefix(tokens_new);
+    int lcp_match_best = lcp_best_base;
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float sim_best    = float(lcp_best) / tokens_new.size();
+    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best_base) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float sim_best    = float(lcp_best_base) / tokens_new.size();
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
     auto it_best = states.end();
+    const uint64_t tick_now = ++stats_tick;
 
-    // find the most similar cached prompt, that would also preserve the most context
+    // Find the most similar cached prompt while recording whether each entry is useful.
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+        const uint64_t lcp_cur_u64 = uint64_t(std::max(0, lcp_cur));
+
+        it->stats.n_seen++;
+        it->stats.tick_seen = tick_now;
+        it->stats.n_best_lcp = std::max(it->stats.n_best_lcp, lcp_cur_u64);
 
         const float f_keep_cur = float(lcp_cur) / it->tokens.size();
         const float sim_cur    = float(lcp_cur) / tokens_new.size();
@@ -1700,13 +1773,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
             f_keep_best = f_keep_cur;
             sim_best    = sim_cur;
+            lcp_match_best = lcp_cur;
 
             it_best = it;
         }
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+        SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f, score = %.3f\n",
+                f_keep_best, sim_best, it_best->stats.score(it_best->size(), it_best->n_tokens(), tick_now));
 
         {
             auto & data = it_best->data.main;
@@ -1742,6 +1817,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
+        it_best->stats.n_hit++;
+        it_best->stats.tick_hit = tick_now;
+        it_best->stats.n_tokens_saved += uint64_t(std::max(0, lcp_match_best));
+
         prompt = std::move(*it_best);
 
         states.erase(it_best);
@@ -1758,9 +1837,18 @@ void server_prompt_cache::update() {
                 break;
             }
 
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            auto it_victim = std::min_element(states.begin(), states.end(), [&](const server_prompt & a, const server_prompt & b) {
+                return a.stats.score(a.size(), a.n_tokens(), stats_tick) < b.stats.score(b.size(), b.n_tokens(), stats_tick);
+            });
 
-            states.pop_front();
+            SRV_WRN(" - cache size limit reached, removing lowest-score entry (score = %.3f, hits = %llu/%llu, tokens = %d, size = %.3f MiB)\n",
+                    it_victim->stats.score(it_victim->size(), it_victim->n_tokens(), stats_tick),
+                    (unsigned long long) it_victim->stats.n_hit,
+                    (unsigned long long) it_victim->stats.n_seen,
+                    it_victim->n_tokens(),
+                    it_victim->size() / (1024.0 * 1024.0));
+
+            states.erase(it_victim);
         }
     }
 
@@ -1776,10 +1864,20 @@ void server_prompt_cache::update() {
                 break;
             }
 
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+            auto it_victim = std::min_element(states.begin(), states.end(), [&](const server_prompt & a, const server_prompt & b) {
+                return a.stats.score(a.size(), a.n_tokens(), stats_tick) < b.stats.score(b.size(), b.n_tokens(), stats_tick);
+            });
 
-            states.pop_front();
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing lowest-score entry (score = %.3f, hits = %llu/%llu, tokens = %d, size = %.3f MiB)\n",
+                    limit_tokens,
+                    limit_tokens_cur,
+                    it_victim->stats.score(it_victim->size(), it_victim->n_tokens(), stats_tick),
+                    (unsigned long long) it_victim->stats.n_hit,
+                    (unsigned long long) it_victim->stats.n_seen,
+                    it_victim->n_tokens(),
+                    it_victim->size() / (1024.0 * 1024.0));
+
+            states.erase(it_victim);
         }
     }
 
@@ -1787,7 +1885,14 @@ void server_prompt_cache::update() {
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB, score: %8.3f, hits: %llu/%llu, best-lcp: %llu\n",
+                (const void *)&state,
+                state.n_tokens(),
+                state.checkpoints.size(),
+                state.size() / (1024.0 * 1024.0),
+                state.stats.score(state.size(), state.n_tokens(), stats_tick),
+                (unsigned long long) state.stats.n_hit,
+                (unsigned long long) state.stats.n_seen,
+                (unsigned long long) state.stats.n_best_lcp);
     }
 }
