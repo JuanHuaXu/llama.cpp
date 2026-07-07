@@ -1234,6 +1234,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    struct mtp_cap_score {
+        double   tokens_per_us = 0.0;
+        uint32_t samples       = 0;
+    };
+
+    static constexpr float    MTP_ADAPT_ACCEPT_ALPHA    = 0.05f;
+    static constexpr double   MTP_ADAPT_SCORE_ALPHA     = 0.20;
+    static constexpr uint32_t MTP_ADAPT_WARMUP          = 24;
+    static constexpr uint32_t MTP_ADAPT_MIN_CAP_SAMPLES = 6;
+    static constexpr uint32_t MTP_ADAPT_PROBE_INTERVAL  = 96;
+
+    std::vector<float> accept_pos_ema;
+    std::vector<mtp_cap_score> cap_scores;
+    std::vector<int32_t> active_cap;
+    std::vector<int64_t> active_start_us;
+    uint32_t accept_updates      = 0;
+    int32_t  n_max_adaptive_last = -1;
+    int32_t  next_probe_cap      = 1;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1303,6 +1322,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        const size_t n_cap = (size_t) std::max(1, this->params.n_max);
+        accept_pos_ema.assign(n_cap, 0.75f);
+        cap_scores.assign(n_cap + 1, {});
+        active_cap.assign(n_seq, -1);
+        active_start_us.assign(n_seq, 0);
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
@@ -1469,8 +1493,88 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    void ensure_adaptive_size() {
+        const size_t n_pos = (size_t) std::max(1, params.n_max);
+        if (accept_pos_ema.size() != n_pos) {
+            accept_pos_ema.assign(n_pos, 0.75f);
+            cap_scores.assign(n_pos + 1, {});
+            accept_updates = 0;
+            next_probe_cap = 1;
+        }
+    }
+
+    int32_t n_max_adaptive() {
+        ensure_adaptive_size();
+
+        if (params.n_max <= 1 || accept_updates < MTP_ADAPT_WARMUP) {
+            return params.n_max;
+        }
+
+        const int32_t n_cap = std::max(1, params.n_max);
+        const int32_t min_cap = std::min(n_cap, std::max(1, params.n_min));
+        for (int32_t cap = min_cap; cap <= n_cap; ++cap) {
+            if (cap_scores[cap].samples < MTP_ADAPT_MIN_CAP_SAMPLES) {
+                return cap;
+            }
+        }
+
+        if (accept_updates % MTP_ADAPT_PROBE_INTERVAL == 0) {
+            const int32_t cap = std::max(min_cap, next_probe_cap);
+            next_probe_cap = cap % n_cap + 1;
+            return cap;
+        }
+
+        int32_t best_cap = n_cap;
+        double best_score = -1.0;
+        for (int32_t cap = min_cap; cap <= n_cap; ++cap) {
+            const auto & score = cap_scores[cap];
+            if (score.samples == 0) {
+                continue;
+            }
+            if (score.tokens_per_us > best_score) {
+                best_score = score.tokens_per_us;
+                best_cap = cap;
+            }
+        }
+
+        return best_cap;
+    }
+
+    void update_adaptive_accept(llama_seq_id seq_id, uint16_t n_accepted) {
+        ensure_adaptive_size();
+
+        if (params.n_max > 1) {
+            ++accept_updates;
+            for (size_t pos = 0; pos < accept_pos_ema.size(); ++pos) {
+                const float sample = pos < n_accepted ? 1.0f : 0.0f;
+                accept_pos_ema[pos] += MTP_ADAPT_ACCEPT_ALPHA * (sample - accept_pos_ema[pos]);
+            }
+        }
+
+        if (seq_id < 0 || seq_id >= (llama_seq_id) active_cap.size()) {
+            return;
+        }
+
+        const int32_t cap = active_cap[seq_id];
+        active_cap[seq_id] = -1;
+        if (cap <= 0 || cap >= (int32_t) cap_scores.size()) {
+            return;
+        }
+
+        const int64_t elapsed_us = std::max<int64_t>(1, ggml_time_us() - active_start_us[seq_id]);
+        const double tokens_per_us = (1.0 + (double) n_accepted) / (double) elapsed_us;
+        auto & score = cap_scores[cap];
+        if (score.samples == 0) {
+            score.tokens_per_us = tokens_per_us;
+        } else {
+            score.tokens_per_us += MTP_ADAPT_SCORE_ALPHA * (tokens_per_us - score.tokens_per_us);
+        }
+        ++score.samples;
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+        const int64_t t_start_us = ggml_time_us();
 
         common_batch_clear(batch);
 
@@ -1499,6 +1603,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
+        }
+
+        const int32_t n_max_eff = n_max_adaptive();
+        if (n_max_eff != n_max_adaptive_last) {
+            const float p0 = accept_pos_ema.size() > 0 ? accept_pos_ema[0] : 0.0f;
+            const float p1 = accept_pos_ema.size() > 1 ? accept_pos_ema[1] : 0.0f;
+            const float p2 = accept_pos_ema.size() > 2 ? accept_pos_ema[2] : 0.0f;
+            const double s1 = cap_scores.size() > 1 ? cap_scores[1].tokens_per_us * 1e6 : 0.0;
+            const double s2 = cap_scores.size() > 2 ? cap_scores[2].tokens_per_us * 1e6 : 0.0;
+            const double s3 = cap_scores.size() > 3 ? cap_scores[3].tokens_per_us * 1e6 : 0.0;
+            SPC_INF("adaptive draft-mtp cap: n_max_eff=%d configured=%d updates=%u ema=(%.3f, %.3f, %.3f) score_tps=(%.1f, %.1f, %.1f) samples=(%u, %u, %u)\n",
+                    n_max_eff, params.n_max, accept_updates, p0, p1, p2, s1, s2, s3,
+                    cap_scores.size() > 1 ? cap_scores[1].samples : 0,
+                    cap_scores.size() > 2 ? cap_scores[2].samples : 0,
+                    cap_scores.size() > 3 ? cap_scores[3].samples : 0);
+            n_max_adaptive_last = n_max_eff;
         }
 
         int i = 0;
@@ -1567,7 +1687,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (n_max_eff <= (int) result.size() || (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1604,6 +1724,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             ++i;
         }
 
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (dp.drafting && !dp.result->empty()) {
+                active_cap[seq_id] = n_max_eff;
+                active_start_us[seq_id] = t_start_us;
+            }
+        }
+
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
         }
@@ -1620,7 +1748,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (!is_other) {
+            update_adaptive_accept(seq_id, n_accepted);
+        }
+
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
