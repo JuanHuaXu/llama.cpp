@@ -12,6 +12,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstring>
 #include <cmath>
@@ -19,6 +20,8 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <unordered_map>
+#include <vector>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -285,6 +288,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
+
             if (!dp.drafting) {
                 continue;
             }
@@ -464,7 +468,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "EAGLE3 requires ctx_tgt and ctx_dft to be set");
 
-        const llama_model * model_dft = llama_get_model(ctx_dft);
+        const llama_model * model_dft = const_cast<llama_model *>(llama_get_model(ctx_dft));
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
 
         target_layer_ids   = llama_model_target_layer_ids  (model_dft);
@@ -931,7 +935,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "DFlash requires ctx_tgt and ctx_dft to be set");
 
-        const llama_model * model_dft = llama_get_model(ctx_dft);
+        const llama_model * model_dft = const_cast<llama_model *>(llama_get_model(ctx_dft));
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
 
         target_layer_ids   = llama_model_target_layer_ids  (model_dft);
@@ -1241,6 +1245,41 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         uint32_t samples       = 0;
     };
 
+    struct mtp_accept_attempt {
+        llama_pos   pos         = 0;
+        llama_token prev_token  = 0;
+        llama_token draft_token = 0;
+        int32_t     depth       = 0;
+        float       p           = 0.0f;
+        float       h_scale     = 1.0f;
+        std::vector<int8_t> h_q8;
+    };
+
+    struct mtp_draft_cache_entry {
+        llama_tokens tokens;
+        std::array<float, 3> accept_ema = { 0.0f, 0.0f, 0.0f };
+        uint32_t updates = 0;
+        uint32_t hits = 0;
+        uint64_t last_used = 0;
+    };
+
+    struct mtp_engram_entry {
+        std::array<float, 3> accept_ema = { 0.0f, 0.0f, 0.0f };
+        uint32_t updates = 0;
+        uint32_t hits = 0;
+        uint64_t last_used = 0;
+    };
+
+    struct mtp_draft_cache_active {
+        bool valid = false;
+        bool from_cache = false;
+        bool engram_valid = false;
+        uint64_t key = 0;
+        uint64_t engram_key = 0;
+        llama_tokens tokens;
+    };
+
+    static constexpr float    MTP_DRAFT_CACHE_ALPHA     = 0.25f;
     static constexpr float    MTP_ADAPT_ACCEPT_ALPHA    = 0.05f;
     static constexpr double   MTP_ADAPT_SCORE_ALPHA     = 0.20;
     static constexpr uint32_t MTP_ADAPT_WARMUP          = 24;
@@ -1251,13 +1290,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<mtp_cap_score> cap_scores;
     std::vector<int32_t> active_cap;
     std::vector<int64_t> active_start_us;
-    std::ofstream mtp_dump;
+    std::fstream mtp_dump;
     std::vector<int8_t> mtp_dump_q8;
+    std::fstream mtp_accept_dump;
+    std::vector<std::vector<mtp_accept_attempt>> mtp_accept_pending;
+    uint64_t mtp_accept_dump_records = 0;
+    uint64_t mtp_accept_batch_id     = 0;
+    bool     mtp_accept_dump_finished = false;
+    std::vector<llama_adapter_lora_ptr> mtp_lora_storage;
+    llama_adapter_lora * mtp_lora_depth[3] = { nullptr, nullptr, nullptr };
+    int32_t  mtp_lora_active_depth = -2;
     uint64_t mtp_dump_records  = 0;
     bool     mtp_dump_finished = false;
     uint32_t accept_updates      = 0;
     int32_t  n_max_adaptive_last = -1;
     int32_t  next_probe_cap      = 1;
+
+    std::unordered_map<uint64_t, mtp_draft_cache_entry> mtp_draft_cache;
+    std::vector<mtp_draft_cache_active> mtp_draft_cache_active;
+    std::unordered_map<uint64_t, mtp_engram_entry> mtp_engram_cache;
+    std::vector<uint64_t> mtp_engram_current_key;
+    std::vector<bool> mtp_engram_current_valid;
+    uint64_t mtp_draft_cache_clock = 0;
+    uint64_t mtp_draft_cache_queries = 0;
+    uint64_t mtp_draft_cache_hits = 0;
+    uint64_t mtp_draft_cache_tokens = 0;
+    uint64_t mtp_engram_cache_hits = 0;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -1317,6 +1375,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !dump_draft_rows);
 
+        if (this->params.mtp_engram_layer_cache) {
+            const int32_t n_layer_tgt = llama_model_n_layer(llama_get_model(ctx_tgt));
+            if (this->params.mtp_engram_layer >= (uint32_t) n_layer_tgt) {
+                throw std::runtime_error("--spec-mtp-engram-layer is outside the target model layer range");
+            }
+            llama_set_embeddings_layer_inp(ctx_tgt, this->params.mtp_engram_layer, true);
+        }
+
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
@@ -1335,6 +1401,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         active_cap.assign(n_seq, -1);
         active_start_us.assign(n_seq, 0);
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        mtp_accept_pending.assign(n_seq, {});
+        mtp_draft_cache_active.assign(n_seq, {});
+        mtp_engram_current_key.assign(n_seq, 0);
+        mtp_engram_current_valid.assign(n_seq, false);
+
+        if (this->params.mtp_draft_cache) {
+            SPC_INF("MTP draft cache enabled: size=%u, context=%u, min_hits=%u, min_accept=%.3f\n",
+                    this->params.mtp_draft_cache_size,
+                    this->params.mtp_draft_cache_context,
+                    this->params.mtp_draft_cache_min_hits,
+                    this->params.mtp_draft_cache_min_accept);
+        }
+        if (this->params.mtp_engram_layer_cache) {
+            SPC_INF("MTP layer engram cache enabled: layer=%u, size=%u, min_hits=%u, min_accept=%.3f\n",
+                    this->params.mtp_engram_layer,
+                    this->params.mtp_engram_cache_size,
+                    this->params.mtp_engram_min_hits,
+                    this->params.mtp_engram_min_accept);
+        }
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1344,6 +1429,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows.assign(n_seq, 0);
 
         init_mtp_train_dump();
+        init_mtp_accept_dump();
+        init_mtp_loras();
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1363,10 +1450,293 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             free(batch.token);
             batch.token = nullptr;
         }
+        set_mtp_lora_depth(-1);
         if (mtp_dump.is_open()) {
             mtp_dump.close();
         }
+        if (mtp_accept_dump.is_open()) {
+            mtp_accept_dump.close();
+        }
+        mtp_lora_storage.clear();
         llama_batch_free(batch);
+    }
+
+    static uint64_t mtp_draft_cache_mix(uint64_t h, uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+
+    uint64_t mtp_engram_signature(const float * row) const {
+        if (!params.mtp_engram_layer_cache || row == nullptr) {
+            return 0;
+        }
+
+        float center = 0.0f;
+        for (int32_t bit = 0; bit < 64; ++bit) {
+            const int32_t idx = (int32_t) (((uint64_t) bit * (uint64_t) n_embd) / 64ULL);
+            center += std::isfinite(row[idx]) ? row[idx] : 0.0f;
+        }
+        center /= 64.0f;
+
+        uint64_t sig = 0;
+        for (int32_t bit = 0; bit < 64; ++bit) {
+            const int32_t idx = (int32_t) (((uint64_t) bit * 11400714819323198485ULL + (uint64_t) bit * 13ULL) % (uint64_t) n_embd);
+            const float v = std::isfinite(row[idx]) ? row[idx] : 0.0f;
+            if (v >= center) {
+                sig |= 1ULL << bit;
+            }
+        }
+
+        sig = mtp_draft_cache_mix(sig, params.mtp_engram_layer);
+        return sig == 0 ? 1 : sig;
+    }
+
+    void set_mtp_engram_current(llama_seq_id seq_id, const float * row) {
+        if (!params.mtp_engram_layer_cache || seq_id < 0 || seq_id >= (llama_seq_id) mtp_engram_current_key.size()) {
+            return;
+        }
+
+        const uint64_t key = mtp_engram_signature(row);
+        mtp_engram_current_key[seq_id] = key;
+        mtp_engram_current_valid[seq_id] = key != 0;
+    }
+
+    int32_t mtp_engram_trusted_len(llama_seq_id seq_id, int32_t requested) {
+        if (!params.mtp_engram_layer_cache) {
+            return requested;
+        }
+        if (requested <= 0 || seq_id < 0 || seq_id >= (llama_seq_id) mtp_engram_current_key.size() ||
+                !mtp_engram_current_valid[seq_id]) {
+            return 0;
+        }
+
+        auto it = mtp_engram_cache.find(mtp_engram_current_key[seq_id]);
+        if (it == mtp_engram_cache.end()) {
+            return 0;
+        }
+
+        auto & entry = it->second;
+        entry.last_used = ++mtp_draft_cache_clock;
+        if (entry.updates < params.mtp_engram_min_hits) {
+            return 0;
+        }
+
+        int32_t n = 0;
+        const int32_t limit = std::min<int32_t>(requested, (int32_t) entry.accept_ema.size());
+        for (; n < limit; ++n) {
+            if (entry.accept_ema[(size_t) n] < params.mtp_engram_min_accept) {
+                break;
+            }
+        }
+        if (n > 0) {
+            ++entry.hits;
+            ++mtp_engram_cache_hits;
+        }
+        return n;
+    }
+
+    void evict_mtp_engram_cache_if_needed() {
+        const uint32_t max_size = params.mtp_engram_cache_size;
+        if (max_size == 0 || mtp_engram_cache.size() <= max_size) {
+            return;
+        }
+
+        auto oldest = mtp_engram_cache.begin();
+        for (auto it = mtp_engram_cache.begin(); it != mtp_engram_cache.end(); ++it) {
+            if (it->second.last_used < oldest->second.last_used) {
+                oldest = it;
+            }
+        }
+        mtp_engram_cache.erase(oldest);
+    }
+
+    void update_mtp_engram_cache(uint64_t key, const llama_tokens & tokens, uint16_t n_accepted) {
+        if (!params.mtp_engram_layer_cache || key == 0 || tokens.empty()) {
+            return;
+        }
+
+        auto & entry = mtp_engram_cache[key];
+        const uint16_t n_acc = std::min<uint16_t>(n_accepted, (uint16_t) tokens.size());
+        const int32_t limit = std::min<int32_t>((int32_t) tokens.size(), (int32_t) entry.accept_ema.size());
+        for (int32_t i = 0; i < limit; ++i) {
+            const float sample = i < n_acc ? 1.0f : 0.0f;
+            if (entry.updates == 0) {
+                entry.accept_ema[(size_t) i] = sample;
+            } else {
+                entry.accept_ema[(size_t) i] += MTP_DRAFT_CACHE_ALPHA * (sample - entry.accept_ema[(size_t) i]);
+            }
+        }
+        ++entry.updates;
+        entry.last_used = ++mtp_draft_cache_clock;
+        evict_mtp_engram_cache_if_needed();
+    }
+
+    uint64_t mtp_draft_cache_key(const common_speculative_draft_params & dp) const {
+        const uint32_t ctx_n = std::max<uint32_t>(1, params.mtp_draft_cache_context);
+        uint64_t h = 1469598103934665603ULL;
+        h = mtp_draft_cache_mix(h, ctx_n);
+        h = mtp_draft_cache_mix(h, (uint64_t) params.n_max);
+
+        const llama_tokens * prompt = dp.prompt;
+        const size_t prompt_size = prompt == nullptr ? 0 : prompt->size();
+        const size_t begin = prompt_size > ctx_n ? prompt_size - ctx_n : 0;
+        size_t mixed = 0;
+        for (size_t i = begin; i < prompt_size; ++i) {
+            h = mtp_draft_cache_mix(h, (uint64_t) (uint32_t) (*prompt)[i]);
+            ++mixed;
+        }
+
+        if (prompt_size == 0 || prompt->back() != dp.id_last) {
+            h = mtp_draft_cache_mix(h, (uint64_t) (uint32_t) dp.id_last);
+            ++mixed;
+        }
+
+        h = mtp_draft_cache_mix(h, mixed);
+        return h == 0 ? 1 : h;
+    }
+
+    int32_t mtp_draft_cache_limit_for(const common_speculative_draft_params & dp, int32_t n_max_eff) const {
+        int32_t limit = std::max(0, n_max_eff);
+        if (dp.n_max > 0) {
+            limit = std::min(limit, dp.n_max);
+        }
+        return std::min(limit, params.n_max);
+    }
+
+    int32_t mtp_draft_cache_trusted_len(
+            const mtp_draft_cache_entry & entry,
+            const common_speculative_draft_params & dp,
+            int32_t n_max_eff) const {
+        if (!params.mtp_draft_cache || entry.updates < params.mtp_draft_cache_min_hits) {
+            return 0;
+        }
+
+        const int32_t limit = std::min<int32_t>((int32_t) entry.tokens.size(), mtp_draft_cache_limit_for(dp, n_max_eff));
+        int32_t n = 0;
+        for (; n < limit && n < (int32_t) entry.accept_ema.size(); ++n) {
+            if (entry.accept_ema[(size_t) n] < params.mtp_draft_cache_min_accept) {
+                break;
+            }
+        }
+        return n;
+    }
+
+    bool try_mtp_draft_cache(llama_seq_id seq_id, common_speculative_draft_params & dp, int32_t n_max_eff) {
+        if (!params.mtp_draft_cache || params.mtp_draft_cache_size == 0 || seq_id < 0 ||
+                seq_id >= (llama_seq_id) mtp_draft_cache_active.size()) {
+            return false;
+        }
+
+        ++mtp_draft_cache_queries;
+        const uint64_t key = mtp_draft_cache_key(dp);
+        auto it = mtp_draft_cache.find(key);
+        if (it == mtp_draft_cache.end()) {
+            return false;
+        }
+
+        auto & entry = it->second;
+        int32_t n = mtp_draft_cache_trusted_len(entry, dp, n_max_eff);
+        n = mtp_engram_trusted_len(seq_id, n);
+        entry.last_used = ++mtp_draft_cache_clock;
+        if (n <= 0) {
+            return false;
+        }
+
+        auto & result = *dp.result;
+        result.insert(result.end(), entry.tokens.begin(), entry.tokens.begin() + n);
+        ++entry.hits;
+        ++mtp_draft_cache_hits;
+        mtp_draft_cache_tokens += (uint64_t) n;
+
+        auto & active = mtp_draft_cache_active[seq_id];
+        active.valid = true;
+        active.from_cache = true;
+        active.key = key;
+        if (params.mtp_engram_layer_cache && seq_id >= 0 && seq_id < (llama_seq_id) mtp_engram_current_key.size()) {
+            active.engram_valid = mtp_engram_current_valid[seq_id];
+            active.engram_key = mtp_engram_current_key[seq_id];
+        }
+        active.tokens.assign(result.begin(), result.end());
+
+        if (mtp_draft_cache_hits == 1 || mtp_draft_cache_hits % 256 == 0) {
+            SPC_INF("MTP draft cache hit: hits=%" PRIu64 ", queries=%" PRIu64 ", tokens=%" PRIu64 ", size=%zu, reused=%d\n",
+                    mtp_draft_cache_hits, mtp_draft_cache_queries, mtp_draft_cache_tokens, mtp_draft_cache.size(), n);
+        }
+
+        return true;
+    }
+
+    void evict_mtp_draft_cache_if_needed() {
+        const uint32_t max_size = params.mtp_draft_cache_size;
+        if (max_size == 0 || mtp_draft_cache.size() <= max_size) {
+            return;
+        }
+
+        auto oldest = mtp_draft_cache.begin();
+        for (auto it = mtp_draft_cache.begin(); it != mtp_draft_cache.end(); ++it) {
+            if (it->second.last_used < oldest->second.last_used) {
+                oldest = it;
+            }
+        }
+        mtp_draft_cache.erase(oldest);
+    }
+
+    void remember_mtp_draft_cache_attempt(llama_seq_id seq_id, const common_speculative_draft_params & dp, bool from_cache) {
+        if (!params.mtp_draft_cache || seq_id < 0 || seq_id >= (llama_seq_id) mtp_draft_cache_active.size() || dp.result == nullptr) {
+            return;
+        }
+
+        auto & active = mtp_draft_cache_active[seq_id];
+        if (active.valid && active.from_cache) {
+            return;
+        }
+
+        active.valid = true;
+        active.from_cache = from_cache;
+        active.key = mtp_draft_cache_key(dp);
+        if (params.mtp_engram_layer_cache && seq_id >= 0 && seq_id < (llama_seq_id) mtp_engram_current_key.size()) {
+            active.engram_valid = mtp_engram_current_valid[seq_id];
+            active.engram_key = mtp_engram_current_key[seq_id];
+        }
+        active.tokens.assign(dp.result->begin(), dp.result->end());
+    }
+
+    void update_mtp_draft_cache(llama_seq_id seq_id, uint16_t n_accepted) {
+        if (!params.mtp_draft_cache || seq_id < 0 || seq_id >= (llama_seq_id) mtp_draft_cache_active.size()) {
+            return;
+        }
+
+        auto & active = mtp_draft_cache_active[seq_id];
+        if (!active.valid || active.tokens.empty()) {
+            return;
+        }
+
+        auto & entry = mtp_draft_cache[active.key];
+        if (entry.tokens != active.tokens) {
+            entry.tokens = active.tokens;
+            entry.accept_ema = { 0.0f, 0.0f, 0.0f };
+            entry.updates = 0;
+            entry.hits = 0;
+        }
+
+        const uint16_t n_acc = std::min<uint16_t>(n_accepted, (uint16_t) active.tokens.size());
+        const int32_t limit = std::min<int32_t>((int32_t) active.tokens.size(), (int32_t) entry.accept_ema.size());
+        for (int32_t i = 0; i < limit; ++i) {
+            const float sample = i < n_acc ? 1.0f : 0.0f;
+            if (entry.updates == 0) {
+                entry.accept_ema[(size_t) i] = sample;
+            } else {
+                entry.accept_ema[(size_t) i] += MTP_DRAFT_CACHE_ALPHA * (sample - entry.accept_ema[(size_t) i]);
+            }
+        }
+        ++entry.updates;
+        entry.last_used = ++mtp_draft_cache_clock;
+        if (active.engram_valid) {
+            update_mtp_engram_cache(active.engram_key, active.tokens, n_accepted);
+        }
+        evict_mtp_draft_cache_if_needed();
+
+        active = {};
     }
 
     template <typename T>
@@ -1374,15 +1744,159 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         mtp_dump.write(reinterpret_cast<const char *>(&value), sizeof(value));
     }
 
-    void init_mtp_train_dump() {
-        if (params.mtp_train_dump.empty()) {
+    void init_mtp_loras() {
+        auto * ctx_dft = params.ctx_dft;
+        if (ctx_dft == nullptr) {
             return;
         }
 
-        mtp_dump.open(params.mtp_train_dump, std::ios::binary | std::ios::trunc);
-        if (!mtp_dump.is_open()) {
-            SPC_WRN("failed to open MTP training dump '%s'\n", params.mtp_train_dump.c_str());
+        llama_model * model_dft = const_cast<llama_model *>(llama_get_model(ctx_dft));
+        for (int i = 0; i < 3; ++i) {
+            const std::string & path = params.mtp_lora_depth[i];
+            if (path.empty()) {
+                continue;
+            }
+
+            llama_adapter_lora_ptr lora;
+            lora.reset(llama_adapter_lora_init(model_dft, path.c_str()));
+            if (lora == nullptr) {
+                throw std::runtime_error("failed to load MTP draft LoRA adapter: " + path);
+            }
+
+            mtp_lora_depth[i] = lora.get();
+            mtp_lora_storage.emplace_back(std::move(lora));
+            SPC_INF("MTP draft LoRA depth %d enabled: path='%s'\n", i + 1, path.c_str());
+        }
+    }
+
+    void set_mtp_lora_depth(int32_t depth) {
+        if (mtp_lora_active_depth == depth) {
+            return;
+        }
+
+        auto * ctx_dft = params.ctx_dft;
+        if (ctx_dft == nullptr) {
+            return;
+        }
+
+        if (depth >= 0 && depth < 3 && mtp_lora_depth[depth] != nullptr) {
+            llama_set_mtp_hidden_lora(ctx_dft, mtp_lora_depth[depth], 1.0f);
+        } else {
+            llama_set_mtp_hidden_lora(ctx_dft, nullptr, 1.0f);
+        }
+        mtp_lora_active_depth = depth;
+    }
+
+    template <typename T>
+    static bool mtp_dump_read_scalar(std::istream & in, T & value) {
+        in.read(reinterpret_cast<char *>(&value), sizeof(value));
+        return in.good();
+    }
+
+    bool init_mtp_train_dump_append(
+            const char expected_magic[8],
+            uint32_t expected_version,
+            uint32_t expected_format,
+            uint32_t expected_labels,
+            uint32_t expected_meta) {
+        std::ifstream in(params.mtp_train_dump, std::ios::binary | std::ios::ate);
+        if (!in.is_open()) {
+            return false;
+        }
+
+        const std::streamoff file_size = in.tellg();
+        if (file_size < 0) {
+            SPC_WRN("failed to inspect existing MTP training dump '%s'\n", params.mtp_train_dump.c_str());
             mtp_dump_finished = true;
+            return true;
+        }
+        if (file_size == 0) {
+            return false;
+        }
+
+        static constexpr std::streamoff header_size = 36;
+        if (file_size < header_size) {
+            SPC_WRN("refusing to append to short MTP training dump '%s' (size=%" PRId64 ")\n",
+                    params.mtp_train_dump.c_str(), (int64_t) file_size);
+            mtp_dump_finished = true;
+            return true;
+        }
+
+        in.seekg(0, std::ios::beg);
+        char magic[8] = {};
+        uint32_t version = 0;
+        uint32_t file_n_embd = 0;
+        uint32_t n_labels = 0;
+        uint32_t format = 0;
+        uint32_t meta = 0;
+        uint64_t old_limit = 0;
+        in.read(magic, sizeof(magic));
+        if (!in.good() ||
+                !mtp_dump_read_scalar(in, version) ||
+                !mtp_dump_read_scalar(in, file_n_embd) ||
+                !mtp_dump_read_scalar(in, n_labels) ||
+                !mtp_dump_read_scalar(in, format) ||
+                !mtp_dump_read_scalar(in, meta) ||
+                !mtp_dump_read_scalar(in, old_limit)) {
+            SPC_WRN("failed to read existing MTP training dump header '%s'\n", params.mtp_train_dump.c_str());
+            mtp_dump_finished = true;
+            return true;
+        }
+
+        if (memcmp(magic, expected_magic, sizeof(magic)) != 0 ||
+                version != expected_version ||
+                file_n_embd != (uint32_t) n_embd ||
+                n_labels != expected_labels ||
+                format != expected_format ||
+                meta != expected_meta) {
+            SPC_WRN("refusing to append incompatible MTP training dump '%s' "
+                    "(version=%u, n_embd=%u, labels=%u, format=%u, meta=%u)\n",
+                    params.mtp_train_dump.c_str(), version, file_n_embd, n_labels, format, meta);
+            mtp_dump_finished = true;
+            return true;
+        }
+
+        const uint64_t record_size = (uint64_t) expected_meta + (uint64_t) n_embd;
+        const uint64_t bytes = (uint64_t) (file_size - header_size);
+        if (bytes % record_size != 0) {
+            SPC_WRN("refusing to append MTP training dump '%s' with partial trailing record (%" PRIu64 " trailing bytes)\n",
+                    params.mtp_train_dump.c_str(), bytes % record_size);
+            mtp_dump_finished = true;
+            return true;
+        }
+
+        mtp_dump_records = bytes / record_size;
+        if (params.mtp_train_dump_limit > 0 && mtp_dump_records >= params.mtp_train_dump_limit) {
+            SPC_INF("MTP training dump already reached limit: records=%" PRIu64 ", limit=%" PRIu64 ", path='%s'\n",
+                    mtp_dump_records, params.mtp_train_dump_limit, params.mtp_train_dump.c_str());
+            mtp_dump_finished = true;
+            return true;
+        }
+
+        mtp_dump.open(params.mtp_train_dump, std::ios::binary | std::ios::in | std::ios::out);
+        if (!mtp_dump.is_open()) {
+            SPC_WRN("failed to open MTP training dump for append '%s'\n", params.mtp_train_dump.c_str());
+            mtp_dump_finished = true;
+            return true;
+        }
+
+        mtp_dump.seekp(28, std::ios::beg);
+        mtp_dump_write_scalar(params.mtp_train_dump_limit);
+        mtp_dump.seekp(0, std::ios::end);
+        if (!mtp_dump.good()) {
+            SPC_WRN("failed to prepare MTP training dump append '%s'\n", params.mtp_train_dump.c_str());
+            mtp_dump.close();
+            mtp_dump_finished = true;
+            return true;
+        }
+
+        SPC_INF("MTP training dump append enabled: path='%s', source=%s, n_embd=%d, format=q8_row_scale, existing=%" PRIu64 ", old_limit=%" PRIu64 ", limit=%" PRIu64 "\n",
+                params.mtp_train_dump.c_str(), params.mtp_train_dump_source.c_str(), n_embd, mtp_dump_records, old_limit, params.mtp_train_dump_limit);
+        return true;
+    }
+
+    void init_mtp_train_dump() {
+        if (params.mtp_train_dump.empty()) {
             return;
         }
 
@@ -1393,6 +1907,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const uint32_t format_q8_row_scale = 1;
         const uint32_t n_labels            = 3;
         const uint32_t record_meta_bytes   = 28; // seq_id, pos, token, 3 labels, f32 scale
+
+        if (params.mtp_train_dump_append &&
+                init_mtp_train_dump_append(magic, version, format_q8_row_scale, n_labels, record_meta_bytes)) {
+            return;
+        }
+
+        mtp_dump.open(params.mtp_train_dump, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!mtp_dump.is_open()) {
+            SPC_WRN("failed to open MTP training dump '%s'\n", params.mtp_train_dump.c_str());
+            mtp_dump_finished = true;
+            return;
+        }
 
         mtp_dump.write(magic, sizeof(magic));
         mtp_dump_write_scalar(version);
@@ -1423,6 +1949,246 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             mtp_dump.close();
             mtp_dump_finished = true;
         }
+    }
+
+    template <typename T>
+    void mtp_accept_dump_write_scalar(const T & value) {
+        mtp_accept_dump.write(reinterpret_cast<const char *>(&value), sizeof(value));
+    }
+
+    static constexpr uint32_t mtp_accept_dump_header_bytes = 32;
+    static constexpr uint32_t mtp_accept_dump_meta_bytes = 52;
+    static constexpr uint32_t mtp_accept_dump_format_q8_row_scale = 1;
+
+    uint32_t mtp_accept_dump_record_bytes() const {
+        return mtp_accept_dump_meta_bytes + (uint32_t) n_embd;
+    }
+
+    bool init_mtp_accept_dump_append(const char expected_magic[8], uint32_t expected_version) {
+        std::ifstream in(params.mtp_accept_dump, std::ios::binary | std::ios::ate);
+        if (!in.is_open()) {
+            return false;
+        }
+
+        const std::streamoff file_size = in.tellg();
+        if (file_size < 0) {
+            SPC_WRN("failed to inspect existing MTP accept/reject dump '%s'\n", params.mtp_accept_dump.c_str());
+            mtp_accept_dump_finished = true;
+            return true;
+        }
+        if (file_size == 0) {
+            return false;
+        }
+        if (file_size < mtp_accept_dump_header_bytes) {
+            SPC_WRN("refusing to append to short MTP accept/reject dump '%s' (size=%" PRId64 ")\n",
+                    params.mtp_accept_dump.c_str(), (int64_t) file_size);
+            mtp_accept_dump_finished = true;
+            return true;
+        }
+
+        in.seekg(0, std::ios::beg);
+        char magic[8] = {};
+        uint32_t version = 0;
+        uint32_t file_n_embd = 0;
+        uint32_t meta_bytes = 0;
+        uint32_t format = 0;
+        uint64_t old_limit = 0;
+        in.read(magic, sizeof(magic));
+        if (!in.good() ||
+                !mtp_dump_read_scalar(in, version) ||
+                !mtp_dump_read_scalar(in, file_n_embd) ||
+                !mtp_dump_read_scalar(in, meta_bytes) ||
+                !mtp_dump_read_scalar(in, format) ||
+                !mtp_dump_read_scalar(in, old_limit)) {
+            SPC_WRN("failed to read existing MTP accept/reject dump header '%s'\n", params.mtp_accept_dump.c_str());
+            mtp_accept_dump_finished = true;
+            return true;
+        }
+
+        if (memcmp(magic, expected_magic, sizeof(magic)) != 0 ||
+                version != expected_version ||
+                file_n_embd != (uint32_t) n_embd ||
+                meta_bytes != mtp_accept_dump_meta_bytes ||
+                format != mtp_accept_dump_format_q8_row_scale) {
+            SPC_WRN("refusing to append incompatible MTP accept/reject dump '%s' "
+                    "(version=%u, n_embd=%u, meta=%u, format=%u)\n",
+                    params.mtp_accept_dump.c_str(), version, file_n_embd, meta_bytes, format);
+            mtp_accept_dump_finished = true;
+            return true;
+        }
+
+        const uint32_t record_bytes = mtp_accept_dump_record_bytes();
+        const uint64_t bytes = (uint64_t) (file_size - mtp_accept_dump_header_bytes);
+        if (bytes % record_bytes != 0) {
+            SPC_WRN("refusing to append MTP accept/reject dump '%s' with partial trailing record (%" PRIu64 " trailing bytes)\n",
+                    params.mtp_accept_dump.c_str(), bytes % record_bytes);
+            mtp_accept_dump_finished = true;
+            return true;
+        }
+
+        mtp_accept_dump_records = bytes / record_bytes;
+        if (params.mtp_accept_dump_limit > 0 && mtp_accept_dump_records >= params.mtp_accept_dump_limit) {
+            SPC_INF("MTP accept/reject dump already reached limit: records=%" PRIu64 ", limit=%" PRIu64 ", path='%s'\n",
+                    mtp_accept_dump_records, params.mtp_accept_dump_limit, params.mtp_accept_dump.c_str());
+            mtp_accept_dump_finished = true;
+            return true;
+        }
+
+        mtp_accept_dump.open(params.mtp_accept_dump, std::ios::binary | std::ios::in | std::ios::out);
+        if (!mtp_accept_dump.is_open()) {
+            SPC_WRN("failed to open MTP accept/reject dump for append '%s'\n", params.mtp_accept_dump.c_str());
+            mtp_accept_dump_finished = true;
+            return true;
+        }
+
+        mtp_accept_dump.seekp(24, std::ios::beg);
+        mtp_accept_dump_write_scalar(params.mtp_accept_dump_limit);
+        mtp_accept_dump.seekp(0, std::ios::end);
+        if (!mtp_accept_dump.good()) {
+            SPC_WRN("failed to prepare MTP accept/reject dump append '%s'\n", params.mtp_accept_dump.c_str());
+            mtp_accept_dump.close();
+            mtp_accept_dump_finished = true;
+            return true;
+        }
+
+        SPC_INF("MTP accept/reject dump append enabled: path='%s', n_embd=%d, existing=%" PRIu64 ", old_limit=%" PRIu64 ", limit=%" PRIu64 "\n",
+                params.mtp_accept_dump.c_str(), n_embd, mtp_accept_dump_records, old_limit, params.mtp_accept_dump_limit);
+        return true;
+    }
+
+    void init_mtp_accept_dump() {
+        if (params.mtp_accept_dump.empty()) {
+            return;
+        }
+
+        const char magic[8] = { 'M', 'T', 'P', 'A', 'C', 'C', '2', '\0' };
+        const uint32_t version = 2;
+
+        if (params.mtp_accept_dump_append && init_mtp_accept_dump_append(magic, version)) {
+            return;
+        }
+
+        mtp_accept_dump.open(params.mtp_accept_dump, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!mtp_accept_dump.is_open()) {
+            SPC_WRN("failed to open MTP accept/reject dump '%s'\n", params.mtp_accept_dump.c_str());
+            mtp_accept_dump_finished = true;
+            return;
+        }
+
+        mtp_accept_dump.write(magic, sizeof(magic));
+        mtp_accept_dump_write_scalar(version);
+        mtp_accept_dump_write_scalar((uint32_t) n_embd);
+        mtp_accept_dump_write_scalar(mtp_accept_dump_meta_bytes);
+        mtp_accept_dump_write_scalar(mtp_accept_dump_format_q8_row_scale);
+        mtp_accept_dump_write_scalar(params.mtp_accept_dump_limit);
+
+        if (!mtp_accept_dump.good()) {
+            SPC_WRN("failed to write MTP accept/reject dump header '%s'\n", params.mtp_accept_dump.c_str());
+            mtp_accept_dump.close();
+            mtp_accept_dump_finished = true;
+            return;
+        }
+
+        SPC_INF("MTP accept/reject dump enabled: path='%s', n_embd=%d, record_size=%u, limit=%" PRIu64 "\n",
+                params.mtp_accept_dump.c_str(), n_embd, mtp_accept_dump_record_bytes(), params.mtp_accept_dump_limit);
+    }
+
+    void finish_mtp_accept_dump_if_needed() {
+        if (!mtp_accept_dump.is_open() || mtp_accept_dump_finished) {
+            return;
+        }
+        if (params.mtp_accept_dump_limit > 0 && mtp_accept_dump_records >= params.mtp_accept_dump_limit) {
+            SPC_INF("MTP accept/reject dump reached limit: records=%" PRIu64 ", path='%s'\n",
+                    mtp_accept_dump_records, params.mtp_accept_dump.c_str());
+            mtp_accept_dump.close();
+            mtp_accept_dump_finished = true;
+        }
+    }
+
+    void add_mtp_accept_attempt(
+            llama_seq_id seq_id,
+            llama_pos pos,
+            llama_token prev_token,
+            llama_token draft_token,
+            int32_t depth,
+            float p,
+            const float * h) {
+        if (!mtp_accept_dump.is_open() || mtp_accept_dump_finished || h == nullptr ||
+                seq_id < 0 || seq_id >= (llama_seq_id) mtp_accept_pending.size()) {
+            return;
+        }
+
+        mtp_accept_attempt attempt;
+        attempt.pos = pos;
+        attempt.prev_token = prev_token;
+        attempt.draft_token = draft_token;
+        attempt.depth = depth;
+        attempt.p = p;
+        attempt.h_q8.resize((size_t) n_embd);
+
+        float max_abs = 0.0f;
+        for (int32_t i = 0; i < n_embd; ++i) {
+            max_abs = std::max(max_abs, std::fabs(h[i]));
+        }
+        attempt.h_scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+        for (int32_t i = 0; i < n_embd; ++i) {
+            const float scaled = h[i] / attempt.h_scale;
+            const int q = std::max(-127, std::min(127, (int) std::lround(scaled)));
+            attempt.h_q8[(size_t) i] = (int8_t) q;
+        }
+
+        mtp_accept_pending[seq_id].push_back(std::move(attempt));
+    }
+
+    void dump_mtp_accept_records(llama_seq_id seq_id, uint16_t n_accepted) {
+        if (!mtp_accept_dump.is_open() || mtp_accept_dump_finished ||
+                seq_id < 0 || seq_id >= (llama_seq_id) mtp_accept_pending.size()) {
+            return;
+        }
+
+        auto & attempts = mtp_accept_pending[seq_id];
+        const int32_t n_drafted = (int32_t) attempts.size();
+        const int32_t n_acc = std::min<int32_t>(n_accepted, n_drafted);
+        const uint64_t batch_id = mtp_accept_batch_id++;
+
+        for (int32_t i = 0; i < n_drafted; ++i) {
+            finish_mtp_accept_dump_if_needed();
+            if (!mtp_accept_dump.is_open()) {
+                break;
+            }
+
+            const auto & a = attempts[i];
+            const int32_t accepted = i < n_acc ? 1 : 0;
+            const int32_t verified = i <= n_acc ? 1 : 0; // after the first rejection, later chain tokens were never target-verified.
+            const float prob = std::isfinite(a.p) ? a.p : 0.0f;
+
+            mtp_accept_dump_write_scalar(batch_id);
+            mtp_accept_dump_write_scalar((int32_t) seq_id);
+            mtp_accept_dump_write_scalar((int32_t) a.pos);
+            mtp_accept_dump_write_scalar((int32_t) a.depth);
+            mtp_accept_dump_write_scalar((int32_t) a.prev_token);
+            mtp_accept_dump_write_scalar((int32_t) a.draft_token);
+            mtp_accept_dump_write_scalar(prob);
+            mtp_accept_dump_write_scalar(accepted);
+            mtp_accept_dump_write_scalar(verified);
+            mtp_accept_dump_write_scalar(n_acc);
+            mtp_accept_dump_write_scalar(n_drafted);
+            mtp_accept_dump_write_scalar(a.h_scale);
+            mtp_accept_dump.write(reinterpret_cast<const char *>(a.h_q8.data()), a.h_q8.size());
+
+            if (!mtp_accept_dump.good()) {
+                SPC_WRN("failed while writing MTP accept/reject dump '%s' after %" PRIu64 " records\n",
+                        params.mtp_accept_dump.c_str(), mtp_accept_dump_records);
+                mtp_accept_dump.close();
+                mtp_accept_dump_finished = true;
+                break;
+            }
+
+            ++mtp_accept_dump_records;
+        }
+
+        attempts.clear();
+        finish_mtp_accept_dump_if_needed();
     }
 
     void write_mtp_train_record(
@@ -1627,6 +2393,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        const float * engram_layer = params.mtp_engram_layer_cache
+            ? llama_get_embeddings_layer_inp(ctx_tgt, params.mtp_engram_layer)
+            : nullptr;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
@@ -1643,6 +2413,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+
+            if (params.mtp_engram_layer_cache) {
+                const float * row = engram_layer == nullptr ? nullptr : engram_layer + (size_t) i_batch_end[seq_id] * n_embd;
+                set_mtp_engram_current(seq_id, row);
+            }
 
             if (params.mtp_train_dump_source == "draft") {
                 dump_mtp_train_rows_draft(batch_in, seq_id, i_batch_beg[seq_id], n_rows);
@@ -1745,10 +2520,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        const int32_t n_max_eff = n_max_adaptive();
+        if (n_max_eff != n_max_adaptive_last) {
+            const float p0 = accept_pos_ema.size() > 0 ? accept_pos_ema[0] : 0.0f;
+            const float p1 = accept_pos_ema.size() > 1 ? accept_pos_ema[1] : 0.0f;
+            const float p2 = accept_pos_ema.size() > 2 ? accept_pos_ema[2] : 0.0f;
+            const double s1 = cap_scores.size() > 1 ? cap_scores[1].tokens_per_us * 1e6 : 0.0;
+            const double s2 = cap_scores.size() > 2 ? cap_scores[2].tokens_per_us * 1e6 : 0.0;
+            const double s3 = cap_scores.size() > 3 ? cap_scores[3].tokens_per_us * 1e6 : 0.0;
+            SPC_INF("adaptive draft-mtp cap: n_max_eff=%d configured=%d updates=%u ema=(%.3f, %.3f, %.3f) score_tps=(%.1f, %.1f, %.1f) samples=(%u, %u, %u)\n",
+                    n_max_eff, params.n_max, accept_updates, p0, p1, p2, s1, s2, s3,
+                    cap_scores.size() > 1 ? cap_scores[1].samples : 0,
+                    cap_scores.size() > 2 ? cap_scores[2].samples : 0,
+                    cap_scores.size() > 3 ? cap_scores[3].samples : 0);
+            n_max_adaptive_last = n_max_eff;
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
+            if (seq_id >= 0 && seq_id < (llama_seq_id) mtp_accept_pending.size()) {
+                mtp_accept_pending[seq_id].clear();
+            }
+            if (seq_id >= 0 && seq_id < (llama_seq_id) mtp_draft_cache_active.size()) {
+                mtp_draft_cache_active[seq_id] = {};
+            }
+
             if (!dp.drafting) {
+                continue;
+            }
+
+            if (try_mtp_draft_cache(seq_id, dp, n_max_eff)) {
                 continue;
             }
 
@@ -1764,22 +2566,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
-        }
-
-        const int32_t n_max_eff = n_max_adaptive();
-        if (n_max_eff != n_max_adaptive_last) {
-            const float p0 = accept_pos_ema.size() > 0 ? accept_pos_ema[0] : 0.0f;
-            const float p1 = accept_pos_ema.size() > 1 ? accept_pos_ema[1] : 0.0f;
-            const float p2 = accept_pos_ema.size() > 2 ? accept_pos_ema[2] : 0.0f;
-            const double s1 = cap_scores.size() > 1 ? cap_scores[1].tokens_per_us * 1e6 : 0.0;
-            const double s2 = cap_scores.size() > 2 ? cap_scores[2].tokens_per_us * 1e6 : 0.0;
-            const double s3 = cap_scores.size() > 3 ? cap_scores[3].tokens_per_us * 1e6 : 0.0;
-            SPC_INF("adaptive draft-mtp cap: n_max_eff=%d configured=%d updates=%u ema=(%.3f, %.3f, %.3f) score_tps=(%.1f, %.1f, %.1f) samples=(%u, %u, %u)\n",
-                    n_max_eff, params.n_max, accept_updates, p0, p1, p2, s1, s2, s3,
-                    cap_scores.size() > 1 ? cap_scores[1].samples : 0,
-                    cap_scores.size() > 2 ? cap_scores[2].samples : 0,
-                    cap_scores.size() > 3 ? cap_scores[3].samples : 0);
-            n_max_adaptive_last = n_max_eff;
         }
 
         int i = 0;
@@ -1801,6 +2587,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            set_mtp_lora_depth(i);
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
@@ -1841,10 +2628,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                common_sampler_accept(smpl, id, true);
-
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
+                const llama_token prev_token = result.empty() ? dp.id_last : result.back();
+                add_mtp_accept_attempt(seq_id, dp.n_past + (llama_pos) result.size() + 1, prev_token, id, i, cur_p->data[0].p, h_row);
+
+                common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
 
@@ -1888,14 +2677,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (dp.drafting && !dp.result->empty()) {
-                active_cap[seq_id] = n_max_eff;
-                active_start_us[seq_id] = t_start_us;
+                remember_mtp_draft_cache_attempt(seq_id, dp, false);
+                const bool from_cache = seq_id >= 0 && seq_id < (llama_seq_id) mtp_draft_cache_active.size() &&
+                    mtp_draft_cache_active[seq_id].from_cache;
+                if (!from_cache) {
+                    active_cap[seq_id] = n_max_eff;
+                    active_start_us[seq_id] = t_start_us;
+                }
             }
         }
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
         }
+        set_mtp_lora_depth(-1);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1911,7 +2706,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (!is_other) {
+            update_mtp_draft_cache(seq_id, n_accepted);
             update_adaptive_accept(seq_id, n_accepted);
+            dump_mtp_accept_records(seq_id, n_accepted);
         }
 
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {

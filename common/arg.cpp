@@ -3746,6 +3746,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_DUMP_LIMIT"));
     add_opt(common_arg(
+        {"--spec-mtp-dump-append"},
+        {"--no-spec-mtp-dump-append"},
+        string_format("append to an existing compatible draft-MTP training dump (default: %s)",
+                      params.speculative.draft.mtp_train_dump_append ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.mtp_train_dump_append = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_DUMP_APPEND"));
+    add_opt(common_arg(
         {"--spec-mtp-dump-source"}, "target|draft",
         "hidden row source for --spec-mtp-dump: target=main model seed hidden, draft=post-MTP hidden (default: target)",
         [](common_params & params, const std::string & value) {
@@ -3755,6 +3764,124 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mtp_train_dump_source = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_DUMP_SOURCE"));
+    add_opt(common_arg(
+        {"--spec-mtp-accept-dump"}, "FNAME",
+        "path to write draft-MTP accept/reject records for rejection-aware training",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_accept_dump = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_ACCEPT_DUMP"));
+    add_opt(common_arg(
+        {"--spec-mtp-accept-dump-limit"}, "N",
+        "maximum number of draft-MTP accept/reject records to write (default: 0 = unlimited)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_accept_dump_limit = std::stoull(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_ACCEPT_DUMP_LIMIT"));
+    add_opt(common_arg(
+        {"--spec-mtp-accept-dump-append"},
+        {"--no-spec-mtp-accept-dump-append"},
+        string_format("append to an existing compatible draft-MTP accept/reject dump (default: %s)",
+                      params.speculative.draft.mtp_accept_dump_append ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.mtp_accept_dump_append = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_ACCEPT_DUMP_APPEND"));
+    add_opt(common_arg(
+        {"--spec-mtp-draft-cache"},
+        {"--no-spec-mtp-draft-cache"},
+        string_format("cache and reuse verified draft-MTP token chains (default: %s)",
+                      params.speculative.draft.mtp_draft_cache ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.mtp_draft_cache = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_DRAFT_CACHE"));
+    add_opt(common_arg(
+        {"--spec-mtp-draft-cache-size"}, "N",
+        "maximum cached draft-MTP windows (default: 8192)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_draft_cache_size = std::stoul(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_DRAFT_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"--spec-mtp-draft-cache-context"}, "N",
+        "accepted prefix tokens used for draft-MTP cache keys (default: 32)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_draft_cache_context = std::stoul(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_DRAFT_CACHE_CONTEXT"));
+    add_opt(common_arg(
+        {"--spec-mtp-draft-cache-min-hits"}, "N",
+        "minimum observations before reusing a cached draft-MTP chain (default: 1)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_draft_cache_min_hits = std::stoul(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_DRAFT_CACHE_MIN_HITS"));
+    add_opt(common_arg(
+        {"--spec-mtp-draft-cache-min-accept"}, "P",
+        "minimum per-position acceptance EMA needed to reuse cached draft-MTP tokens (default: 0.80)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_draft_cache_min_accept = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_DRAFT_CACHE_MIN_ACCEPT"));
+    add_opt(common_arg(
+        {"--spec-mtp-engram-layer-cache"},
+        {"--no-spec-mtp-engram-layer-cache"},
+        string_format("rate draft-MTP cache reuse with target layer signatures (default: %s)",
+                      params.speculative.draft.mtp_engram_layer_cache ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.mtp_engram_layer_cache = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_ENGRAM_LAYER_CACHE"));
+    add_opt(common_arg(
+        {"--spec-mtp-engram-layer"}, "N",
+        "target layer input to hash for draft-MTP engram ratings (default: 2)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_engram_layer = std::stoul(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_ENGRAM_LAYER"));
+    add_opt(common_arg(
+        {"--spec-mtp-engram-cache-size"}, "N",
+        "maximum layer-signature engram ratings for draft-MTP cache reuse (default: 8192)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_engram_cache_size = std::stoul(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_ENGRAM_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"--spec-mtp-engram-min-hits"}, "N",
+        "minimum observations before a layer engram can authorize draft-cache reuse (default: 2)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_engram_min_hits = std::stoul(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_ENGRAM_MIN_HITS"));
+    add_opt(common_arg(
+        {"--spec-mtp-engram-min-accept"}, "P",
+        "minimum layer-engram acceptance EMA needed to reuse cached drafts (default: 0.75)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_engram_min_accept = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_ENGRAM_MIN_ACCEPT"));
+    add_opt(common_arg(
+        {"--spec-mtp-lora-depth1"}, "FNAME",
+        "draft-only LoRA adapter to apply for MTP draft depth 1 (first drafted token)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_lora_depth[0] = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LORA_DEPTH1"));
+    add_opt(common_arg(
+        {"--spec-mtp-lora-depth2"}, "FNAME",
+        "draft-only LoRA adapter to apply for MTP draft depth 2 (second drafted token)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_lora_depth[1] = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LORA_DEPTH2"));
+    add_opt(common_arg(
+        {"--spec-mtp-lora-depth3"}, "FNAME",
+        "draft-only LoRA adapter to apply for MTP draft depth 3 (third drafted token)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_lora_depth[2] = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LORA_DEPTH3"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"

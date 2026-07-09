@@ -673,9 +673,11 @@ struct llm_graph_params {
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
 
-    const llama_adapter_cvec     * cvec;
-    const llama_adapter_loras    * loras;
-    const llama_memory_context_i * mctx;
+    const llama_adapter_cvec        * cvec;
+    const llama_adapter_loras       * loras;
+    const llama_adapter_lora_weight * mtp_hidden_lora;
+    float mtp_hidden_lora_scale = 1.0f;
+    const llama_memory_context_i    * mctx;
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -902,9 +904,11 @@ struct llm_graph_context {
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
-    const llama_adapter_cvec     * cvec;
-    const llama_adapter_loras    * loras;
-    const llama_memory_context_i * mctx;
+    const llama_adapter_cvec        * cvec;
+    const llama_adapter_loras       * loras;
+    const llama_adapter_lora_weight * mtp_hidden_lora;
+    float mtp_hidden_lora_scale = 1.0f;
+    const llama_memory_context_i    * mctx;
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;

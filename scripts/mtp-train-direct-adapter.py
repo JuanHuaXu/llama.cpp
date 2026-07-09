@@ -107,14 +107,19 @@ class LowRankHead(nn.Module):
         nn.init.normal_(self.down.weight, std=0.01)
         nn.init.zeros_(self.up.weight)
 
-    def forward(self, h):
+    def base(self, h):
         h = h.float()
         if self.input_normalized:
-            z = h
-        else:
-            rms = torch.rsqrt(torch.mean(h * h, dim=-1, keepdim=True) + 1e-6)
-            z = h * rms * self.norm_weight
-        z = z + self.up(self.down(z)) * self.scale
+            return h
+        rms = torch.rsqrt(torch.mean(h * h, dim=-1, keepdim=True) + 1e-6)
+        return h * rms * self.norm_weight
+
+    def forward(self, h, return_parts=False):
+        z_base = self.base(h)
+        delta = self.up(self.down(z_base)) * self.scale
+        z = z_base + delta
+        if return_parts:
+            return z, z_base, delta
         return z
 
 
@@ -128,26 +133,96 @@ def sample_batch(records, batch_size, label_name, device, rng):
     return h, y
 
 
-def evaluate(model, output_weight, records, label_name, batch_size, batches, device, seed):
+def logits_for(model, output_weight, h, return_parts=False):
+    if return_parts:
+        z, z_base, delta = model(h, return_parts=True)
+        logits = z.to(dtype=torch.float16) @ output_weight.T
+        base_logits = z_base.to(dtype=torch.float16) @ output_weight.T
+        return logits, base_logits, delta
+    z = model(h)
+    return z.to(dtype=torch.float16) @ output_weight.T
+
+
+def continuation_losses(logits, y, p_min, base_logits=None, delta=None):
+    logits_f = logits.float()
+    ce = F.cross_entropy(logits_f, y)
+    logp = F.log_softmax(logits_f, dim=-1)
+    top_logp = logp.max(dim=-1).values
+    correct_logp = logp.gather(1, y[:, None]).squeeze(1)
+    log_p_min = math.log(p_min)
+
+    # Draft length is gated by the sampled top-token probability. The margin
+    # term handles rows below the gate; the confidence term keeps pushing once
+    # the gate is already cleared, matching the "keep drafting" objective.
+    continue_loss = F.relu(log_p_min - top_logp).mean()
+    top_confidence_loss = -top_logp.mean()
+    correct_margin_loss = F.relu(log_p_min - correct_logp).mean()
+
+    if base_logits is None:
+        base_kl_loss = logits_f.new_zeros(())
+    else:
+        base_logp = F.log_softmax(base_logits.float(), dim=-1)
+        base_kl_loss = F.kl_div(logp, base_logp.exp(), reduction="batchmean")
+
+    if delta is None:
+        delta_norm_loss = logits_f.new_zeros(())
+    else:
+        delta_norm_loss = delta.float().pow(2).mean()
+
+    return ce, continue_loss, top_confidence_loss, correct_margin_loss, base_kl_loss, delta_norm_loss
+
+
+def evaluate(model, output_weight, records, label_name, batch_size, batches, device, seed, p_min):
     model.eval()
     rng = np.random.default_rng(seed)
     total_loss = 0.0
     total = 0
     top1 = 0
     top5 = 0
+    base_top1 = 0
+    changed_top1 = 0
+    top1_p_sum = 0.0
+    correct_p_sum = 0.0
+    continue_n = 0
+    correct_continue_n = 0
+    base_kl_sum = 0.0
+    delta_norm_sum = 0.0
     with torch.no_grad():
         for _ in range(batches):
             h, y = sample_batch(records, batch_size, label_name, device, rng)
-            z = model(h)
-            logits = z.to(dtype=torch.float16) @ output_weight.T
+            logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
+            probs = F.softmax(logits.float(), dim=-1)
+            top_prob, top_idx = torch.topk(probs, k=5, dim=-1)
+            base_top = torch.argmax(base_logits, dim=-1)
+            correct_prob = probs.gather(1, y[:, None]).squeeze(1)
             loss = F.cross_entropy(logits.float(), y)
-            pred = torch.topk(logits, k=5, dim=-1).indices
-            top1 += (pred[:, 0] == y).sum().item()
-            top5 += (pred == y[:, None]).any(dim=-1).sum().item()
+            _, _, _, _, base_kl_loss, delta_norm_loss = continuation_losses(logits, y, p_min, base_logits, delta)
+            top1 += (top_idx[:, 0] == y).sum().item()
+            top5 += (top_idx == y[:, None]).any(dim=-1).sum().item()
+            base_top1 += (base_top == y).sum().item()
+            changed_top1 += (top_idx[:, 0] != base_top).sum().item()
+            top1_p_sum += top_prob[:, 0].sum().item()
+            correct_p_sum += correct_prob.sum().item()
+            continue_n += (top_prob[:, 0] >= p_min).sum().item()
+            correct_continue_n += (correct_prob >= p_min).sum().item()
+            base_kl_sum += base_kl_loss.item() * y.numel()
+            delta_norm_sum += delta_norm_loss.item() * y.numel()
             total_loss += loss.item() * y.numel()
             total += y.numel()
     model.train()
-    return {"loss": total_loss / total, "top1": top1 / total, "top5": top5 / total}
+    return {
+        "loss": total_loss / total,
+        "top1": top1 / total,
+        "top5": top5 / total,
+        "base_top1": base_top1 / total,
+        "changed_top1_rate": changed_top1 / total,
+        "top1_p": top1_p_sum / total,
+        "correct_p": correct_p_sum / total,
+        "continue_rate": continue_n / total,
+        "correct_continue_rate": correct_continue_n / total,
+        "base_kl": base_kl_sum / total,
+        "delta_norm": delta_norm_sum / total,
+    }
 
 
 def main():
@@ -163,6 +238,14 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--eval-batches", type=int, default=32)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--ce-weight", type=float, default=1.0)
+    parser.add_argument("--continue-weight", type=float, default=0.0)
+    parser.add_argument("--top-confidence-weight", type=float, default=0.0)
+    parser.add_argument("--correct-margin-weight", type=float, default=0.0)
+    parser.add_argument("--base-kl-weight", type=float, default=0.0)
+    parser.add_argument("--delta-norm-weight", type=float, default=0.0)
+    parser.add_argument("--init-adapter", default="")
+    parser.add_argument("--p-min", type=float, default=0.1)
     parser.add_argument("--input-normalized", action="store_true", help="treat dumped rows as already normalized for the shared output head")
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
@@ -178,6 +261,9 @@ def main():
     output_weight = load_output_weight(reader, args.output_cache, device)
     norm_weight = load_norm_weight(reader, header["n_embd"], device)
     model = LowRankHead(header["n_embd"], args.rank, norm_weight, args.input_normalized).to(device=device, dtype=torch.float32)
+    if args.init_adapter:
+        init = torch.load(args.init_adapter, map_location="cpu", weights_only=False)
+        model.load_state_dict(init["state_dict"], strict=False)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     rng = np.random.default_rng(args.seed)
 
@@ -194,29 +280,47 @@ def main():
                 "steps": args.steps,
                 "device": str(device),
                 "input_normalized": bool(args.input_normalized),
+                "ce_weight": args.ce_weight,
+                "continue_weight": args.continue_weight,
+                "top_confidence_weight": args.top_confidence_weight,
+                "correct_margin_weight": args.correct_margin_weight,
+                "base_kl_weight": args.base_kl_weight,
+                "delta_norm_weight": args.delta_norm_weight,
+                "init_adapter": args.init_adapter,
+                "p_min": args.p_min,
             }
         ),
         flush=True,
     )
 
-    start_eval = evaluate(model, output_weight, records, args.label, args.batch_size, args.eval_batches, device, args.seed + 1)
+    start_eval = evaluate(model, output_weight, records, args.label, args.batch_size, args.eval_batches, device, args.seed + 1, args.p_min)
     print(json.dumps({"event": "eval_start", **start_eval}), flush=True)
 
     t0 = time.perf_counter()
     progress = tqdm(range(1, args.steps + 1), dynamic_ncols=True)
     for step in progress:
         h, y = sample_batch(records, args.batch_size, args.label, device, rng)
-        z = model(h)
-        logits = z.to(dtype=torch.float16) @ output_weight.T
-        loss = F.cross_entropy(logits.float(), y)
+        logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
+        ce, continue_loss, top_confidence_loss, correct_margin_loss, base_kl_loss, delta_norm_loss = continuation_losses(
+            logits, y, args.p_min, base_logits, delta)
+        loss = (
+            args.ce_weight * ce
+            + args.continue_weight * continue_loss
+            + args.top_confidence_weight * top_confidence_loss
+            + args.correct_margin_weight * correct_margin_loss
+            + args.base_kl_weight * base_kl_loss
+            + args.delta_norm_weight * delta_norm_loss
+        )
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if step % 25 == 0:
-            progress.set_description(f"loss={loss.item():.4f}")
+            progress.set_description(
+                f"loss={loss.item():.4f} ce={ce.item():.4f} cont={continue_loss.item():.4f} "
+                f"conf={top_confidence_loss.item():.4f} kl={base_kl_loss.item():.4f}")
 
-    end_eval = evaluate(model, output_weight, records, args.label, args.batch_size, args.eval_batches, device, args.seed + 2)
+    end_eval = evaluate(model, output_weight, records, args.label, args.batch_size, args.eval_batches, device, args.seed + 2, args.p_min)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     torch.save(
         {

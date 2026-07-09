@@ -146,6 +146,15 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
     return nullptr;
 }
 
+llama_adapter_lora_weight * llama_adapter_lora::get_mtp_hidden() {
+    const auto pos = ab_map.find("mtp_hidden");
+    if (pos != ab_map.end()) {
+        return &pos->second;
+    }
+
+    return nullptr;
+}
+
 static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {
     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
 
@@ -326,18 +335,36 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             throw std::runtime_error("LoRA tensor pair for '" + name + "' is missing one component");
         }
 
-        // device buft and device ctx
-        const auto * model_tensor = model.get_tensor(name.c_str());
-        if (!model_tensor) {
-            throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
+        const bool is_mtp_hidden = name == "mtp_hidden";
+        const ggml_tensor * model_tensor = nullptr;
+        ggml_backend_buffer_type_t buft = nullptr;
+
+        if (is_mtp_hidden) {
+            if (w.a->ne[0] != w.b->ne[1] || w.a->ne[1] != w.b->ne[0]) {
+                throw std::runtime_error("MTP hidden LoRA tensor pair has incorrect shape");
+            }
+            const uint32_t mtp_layer = model.hparams.n_layer();
+            if (mtp_layer >= model.hparams.n_layer_all) {
+                throw std::runtime_error("MTP hidden LoRA requires a model with appended NextN layers");
+            }
+            buft = model.select_buft(mtp_layer);
+            LLAMA_LOG_INFO("%s: MTP hidden LoRA uses layer %u buft '%s'\n", __func__, mtp_layer, ggml_backend_buft_name(buft));
+        } else {
+            // device buft and device ctx
+            model_tensor = model.get_tensor(name.c_str());
+            if (!model_tensor) {
+                throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
+            }
+
+            buft = ggml_backend_buffer_get_type(model_tensor->buffer);
         }
 
-        auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
+        const char * adapter_target_name = is_mtp_hidden ? name.c_str() : model_tensor->name;
 
         // do not load loras to extra buffer types (i.e. bufts for repacking) -> use the CPU in that case
         for (auto & ex : buft_extra) {
             if (ex == buft) {
-                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
+                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, adapter_target_name, ggml_backend_buft_name(buft));
 
                 auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
                 if (!cpu_dev) {
@@ -349,21 +376,23 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             }
         }
 
-        LLAMA_LOG_DEBUG("%s: lora for '%s' -> '%s'\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
+        LLAMA_LOG_DEBUG("%s: lora for '%s' -> '%s'\n", __func__, adapter_target_name, ggml_backend_buft_name(buft));
 
         ggml_context * dev_ctx = ctx_for_buft(buft);
         // validate tensor shape
-        if (is_token_embd) {
-            // expect B to be non-transposed, A and B are flipped; see llm_build_inp_embd()
-            if (model_tensor->ne[0] != w.b->ne[1] || model_tensor->ne[1] != w.a->ne[1]) {
-                throw std::runtime_error("tensor '" + name + "' has incorrect shape (hint: maybe wrong base model?)");
-            }
-        } else {
-            if (model_tensor->ne[0] != w.a->ne[0] || model_tensor->ne[1] != w.b->ne[1]) {
-                throw std::runtime_error("tensor '" + name + "' has incorrect shape (hint: maybe wrong base model?)");
-            }
-            if (w.a->ne[1] != w.b->ne[0]) {
-                throw std::runtime_error("lora_a tensor is not transposed (hint: adapter from \"finetune\" example is no longer supported)");
+        if (!is_mtp_hidden) {
+            if (is_token_embd) {
+                // expect B to be non-transposed, A and B are flipped; see llm_build_inp_embd()
+                if (model_tensor->ne[0] != w.b->ne[1] || model_tensor->ne[1] != w.a->ne[1]) {
+                    throw std::runtime_error("tensor '" + name + "' has incorrect shape (hint: maybe wrong base model?)");
+                }
+            } else {
+                if (model_tensor->ne[0] != w.a->ne[0] || model_tensor->ne[1] != w.b->ne[1]) {
+                    throw std::runtime_error("tensor '" + name + "' has incorrect shape (hint: maybe wrong base model?)");
+                }
+                if (w.a->ne[1] != w.b->ne[0]) {
+                    throw std::runtime_error("lora_a tensor is not transposed (hint: adapter from \"finetune\" example is no longer supported)");
+                }
             }
         }
 

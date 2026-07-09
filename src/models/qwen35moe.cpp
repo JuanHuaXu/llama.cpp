@@ -730,6 +730,13 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     cb(cur, "mtp_shared_head_norm", -1);
 
+    if (mtp_hidden_lora) {
+        ggml_tensor * delta = ggml_mul_mat(ctx0, mtp_hidden_lora->b, ggml_mul_mat(ctx0, mtp_hidden_lora->a, cur));
+        delta = ggml_scale(ctx0, delta, mtp_hidden_lora->get_scale(0.0f, mtp_hidden_lora_scale));
+        cur = ggml_add(ctx0, cur, delta);
+        cb(cur, "mtp_hidden_lora", -1);
+    }
+
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");

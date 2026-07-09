@@ -1348,6 +1348,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
+    mtp_hidden_lora  (params.mtp_hidden_lora),
+    mtp_hidden_lora_scale(params.mtp_hidden_lora_scale),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),

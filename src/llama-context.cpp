@@ -1160,6 +1160,16 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_mtp_hidden_lora(llama_adapter_lora * adapter, float scale) {
+    llama_adapter_lora_weight * weight = adapter ? adapter->get_mtp_hidden() : nullptr;
+    if (mtp_hidden_lora == weight && mtp_hidden_lora_scale == scale) {
+        return;
+    }
+
+    mtp_hidden_lora = weight;
+    mtp_hidden_lora_scale = scale;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -2411,9 +2421,11 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
-        /*.cvec        =*/ cvec.get(),
-        /*.loras       =*/ loras.get(),
-        /*.mctx        =*/ mctx,
+        /*.cvec                  =*/ cvec.get(),
+        /*.loras                 =*/ loras.get(),
+        /*.mtp_hidden_lora       =*/ mtp_hidden_lora,
+        /*.mtp_hidden_lora_scale =*/ mtp_hidden_lora_scale,
+        /*.mctx                  =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -3709,6 +3721,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_mtp_hidden_lora(llama_context * ctx, llama_adapter_lora * adapter, float scale) {
+    ctx->set_mtp_hidden_lora(adapter, scale);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

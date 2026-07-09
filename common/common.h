@@ -333,6 +333,25 @@ struct common_params_speculative_draft {
     std::string mtp_train_dump; // path to write draft-MTP training records
     std::string mtp_train_dump_source = "target"; // source hidden rows: target or draft
     uint64_t mtp_train_dump_limit = 0; // maximum records to dump (0 = unlimited)
+    bool mtp_train_dump_append = false; // append to an existing compatible dump instead of truncating
+
+    std::string mtp_accept_dump; // path to write draft-MTP accept/reject records
+    uint64_t mtp_accept_dump_limit = 0; // maximum accept/reject records to dump (0 = unlimited)
+    bool mtp_accept_dump_append = false; // append to an existing compatible accept/reject dump
+
+    bool mtp_draft_cache = false; // reuse verified draft-MTP chains for repeated token windows
+    uint32_t mtp_draft_cache_size = 8192; // maximum cached draft windows
+    uint32_t mtp_draft_cache_context = 32; // tokens from the accepted prefix used as the cache key
+    uint32_t mtp_draft_cache_min_hits = 1; // observations before a cached chain can be reused
+    float mtp_draft_cache_min_accept = 0.80f; // minimum per-position acceptance EMA for reuse
+
+    bool mtp_engram_layer_cache = false; // rate draft reuse by early-layer target hidden-state signatures
+    uint32_t mtp_engram_layer = 2; // target layer input to hash for engram ratings
+    uint32_t mtp_engram_cache_size = 8192; // maximum layer-signature ratings
+    uint32_t mtp_engram_min_hits = 2; // observations before layer ratings can authorize draft-cache reuse
+    float mtp_engram_min_accept = 0.75f; // minimum engram acceptance EMA for cached draft reuse
+
+    std::string mtp_lora_depth[3]; // optional draft-only LoRA adapters for MTP depths 1..3
 
     common_params_model mparams;
 
