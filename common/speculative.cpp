@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <fstream>
@@ -21,6 +22,7 @@
 #include <map>
 #include <cinttypes>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1317,6 +1319,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     uint64_t mtp_draft_cache_tokens = 0;
     uint64_t mtp_engram_cache_hits = 0;
 
+    std::vector<uint8_t> mtp_fr_allowed;
+    uint64_t mtp_fr_queries = 0;
+    uint64_t mtp_fr_first_allowed = 0;
+    uint64_t mtp_fr_replaced = 0;
+    uint64_t mtp_fr_blocked = 0;
+    uint64_t mtp_fr_prompt_allowed = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1329,6 +1338,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(n_embd == llama_model_n_embd(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+        init_mtp_fr_vocab();
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -1350,7 +1360,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            sparams.top_k    = mtp_fr_allowed.empty() ? 10 : std::max<int32_t>(10, (int32_t) this->params.mtp_fr_top_k);
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -1360,7 +1370,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(
+                            mtp_fr_allowed.empty() ? 10 : std::max<int32_t>(10, (int32_t) this->params.mtp_fr_top_k)));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1464,6 +1475,137 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     static uint64_t mtp_draft_cache_mix(uint64_t h, uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         return h;
+    }
+
+    void init_mtp_fr_vocab() {
+        if (params.mtp_fr_vocab.empty()) {
+            return;
+        }
+
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(params.ctx_dft));
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        mtp_fr_allowed.assign((size_t) n_vocab, 0);
+
+        std::ifstream in(params.mtp_fr_vocab);
+        if (!in.is_open()) {
+            throw std::runtime_error("failed to open MTP FR vocab: " + params.mtp_fr_vocab);
+        }
+
+        uint64_t loaded = 0;
+        std::string line;
+        while (std::getline(in, line)) {
+            const size_t comment = line.find('#');
+            if (comment != std::string::npos) {
+                line.resize(comment);
+            }
+
+            char * end = nullptr;
+            const long value = std::strtol(line.c_str(), &end, 10);
+            if (end == line.c_str()) {
+                continue;
+            }
+            if (value < 0 || value >= n_vocab) {
+                continue;
+            }
+            if (!mtp_fr_allowed[(size_t) value]) {
+                mtp_fr_allowed[(size_t) value] = 1;
+                ++loaded;
+            }
+        }
+
+        if (loaded == 0) {
+            throw std::runtime_error("MTP FR vocab did not contain any valid token ids: " + params.mtp_fr_vocab);
+        }
+
+        SPC_INF("MTP FR vocab enabled: path='%s', tokens=%" PRIu64 ", top_k=%u, prompt_tokens=%d, prompt_context=%u\n",
+                params.mtp_fr_vocab.c_str(), loaded, params.mtp_fr_top_k,
+                (int) params.mtp_fr_prompt_tokens, params.mtp_fr_prompt_context);
+    }
+
+    bool mtp_fr_prompt_has_token(const common_speculative_draft_params & dp, llama_token id) const {
+        if (!params.mtp_fr_prompt_tokens || dp.prompt == nullptr || params.mtp_fr_prompt_context == 0) {
+            return false;
+        }
+
+        const llama_tokens & prompt = *dp.prompt;
+        const size_t prompt_size = prompt.size();
+        const size_t begin = prompt_size > params.mtp_fr_prompt_context ? prompt_size - params.mtp_fr_prompt_context : 0;
+        for (size_t i = begin; i < prompt_size; ++i) {
+            if (prompt[i] == id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool mtp_fr_token_allowed(const common_speculative_draft_params & dp, llama_token id, bool * allowed_by_prompt) const {
+        if (mtp_fr_allowed.empty()) {
+            return true;
+        }
+        if (id >= 0 && (size_t) id < mtp_fr_allowed.size() && mtp_fr_allowed[(size_t) id]) {
+            if (allowed_by_prompt) {
+                *allowed_by_prompt = false;
+            }
+            return true;
+        }
+        if (mtp_fr_prompt_has_token(dp, id)) {
+            if (allowed_by_prompt) {
+                *allowed_by_prompt = true;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    llama_token mtp_fr_select_candidate(
+            const common_speculative_draft_params & dp,
+            const llama_token_data_array * cur_p,
+            float & p_selected) {
+        if (cur_p == nullptr || cur_p->size <= 0) {
+            p_selected = 0.0f;
+            return LLAMA_TOKEN_NULL;
+        }
+
+        if (mtp_fr_allowed.empty()) {
+            p_selected = cur_p->data[0].p;
+            return cur_p->data[0].id;
+        }
+
+        ++mtp_fr_queries;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            bool allowed_by_prompt = false;
+            const llama_token id = cur_p->data[k].id;
+            if (!mtp_fr_token_allowed(dp, id, &allowed_by_prompt)) {
+                continue;
+            }
+
+            p_selected = cur_p->data[k].p;
+            if (k == 0) {
+                ++mtp_fr_first_allowed;
+            } else {
+                ++mtp_fr_replaced;
+            }
+            if (allowed_by_prompt) {
+                ++mtp_fr_prompt_allowed;
+            }
+            return id;
+        }
+
+        ++mtp_fr_blocked;
+        p_selected = 0.0f;
+        return LLAMA_TOKEN_NULL;
+    }
+
+    void maybe_log_mtp_fr_stats() const {
+        if (mtp_fr_allowed.empty() || mtp_fr_queries == 0) {
+            return;
+        }
+        if (mtp_fr_queries != 1 && mtp_fr_queries % 512 != 0) {
+            return;
+        }
+
+        SPC_INF("MTP FR vocab stats: queries=%" PRIu64 ", first=%" PRIu64 ", replaced=%" PRIu64 ", blocked=%" PRIu64 ", prompt_allowed=%" PRIu64 "\n",
+                mtp_fr_queries, mtp_fr_first_allowed, mtp_fr_replaced, mtp_fr_blocked, mtp_fr_prompt_allowed);
     }
 
     uint64_t mtp_engram_signature(const float * row) const {
@@ -2617,21 +2759,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                auto & dp = dparams.at(seq_id);
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                float p_draft = 0.0f;
+                const llama_token id = mtp_fr_select_candidate(dp, cur_p, p_draft);
+                maybe_log_mtp_fr_stats();
+
+                // only collect sufficiently confident draft tokens
+                if (id == LLAMA_TOKEN_NULL || p_draft < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
                     continue;
                 }
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
                 const llama_token prev_token = result.empty() ? dp.id_last : result.back();
-                add_mtp_accept_attempt(seq_id, dp.n_past + (llama_pos) result.size() + 1, prev_token, id, i, cur_p->data[0].p, h_row);
+                add_mtp_accept_attempt(seq_id, dp.n_past + (llama_pos) result.size() + 1, prev_token, id, i, p_draft, h_row);
 
                 common_sampler_accept(smpl, id, true);
 

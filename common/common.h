@@ -353,6 +353,11 @@ struct common_params_speculative_draft {
 
     std::string mtp_lora_depth[3]; // optional draft-only LoRA adapters for MTP depths 1..3
 
+    std::string mtp_fr_vocab; // optional frequency-ranked token allowlist for MTP drafting
+    uint32_t mtp_fr_top_k = 256; // sampler candidates scanned when the allowlist is active
+    bool mtp_fr_prompt_tokens = true; // also allow recent prompt/generated tokens outside the allowlist
+    uint32_t mtp_fr_prompt_context = 2048; // recent prompt tokens scanned for allowlist extension
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

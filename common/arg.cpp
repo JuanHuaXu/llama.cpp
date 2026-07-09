@@ -3883,6 +3883,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LORA_DEPTH3"));
     add_opt(common_arg(
+        {"--spec-mtp-fr-vocab"}, "FNAME",
+        "frequency-ranked token allowlist for draft-MTP candidate selection",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_fr_vocab = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_FR_VOCAB"));
+    add_opt(common_arg(
+        {"--spec-mtp-fr-top-k"}, "N",
+        "number of draft-MTP sampler candidates to scan when --spec-mtp-fr-vocab is set (default: 256)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_fr_top_k = std::stoul(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_FR_TOP_K"));
+    add_opt(common_arg(
+        {"--spec-mtp-fr-prompt-tokens"},
+        {"--no-spec-mtp-fr-prompt-tokens"},
+        string_format("also allow recent prompt/generated tokens outside the FR vocab (default: %s)",
+                      params.speculative.draft.mtp_fr_prompt_tokens ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.mtp_fr_prompt_tokens = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_FR_PROMPT_TOKENS"));
+    add_opt(common_arg(
+        {"--spec-mtp-fr-prompt-context"}, "N",
+        "recent prompt/generated tokens scanned for FR allowlist extension (default: 2048)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_fr_prompt_context = std::stoul(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_FR_PROMPT_CONTEXT"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
         "use --list-devices to see a list of available devices",
