@@ -295,7 +295,7 @@ def pairwise_rank_flip_loss(model, output_weight, h, correct, draft, margin):
     return loss, delta_norm, flip, base_flip, margin_mean, base_margin_mean
 
 
-def target_overlap_loss(model, output_weight, h, target_candidates, target_ps):
+def target_overlap_loss(model, output_weight, h, target_candidates, target_ps, normalize_target=True):
     logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
     logits_f = logits.float()
     probs = F.softmax(logits_f, dim=-1)
@@ -303,7 +303,11 @@ def target_overlap_loss(model, output_weight, h, target_candidates, target_ps):
     safe_candidates = target_candidates.clamp_min(0)
     q = probs.gather(1, safe_candidates) * mask.float()
     p = target_ps.float() * mask.float()
-    p = p / p.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    p_mass = p.sum(dim=1)
+    if normalize_target:
+        p = p / p_mass[:, None].clamp_min(1e-6)
+    # LK-style mode leaves missing target mass outside the draft frontier instead of
+    # renormalizing it away, so low-coverage rows stay expensive.
     overlap = torch.minimum(q, p).sum(dim=1).clamp_min(1e-6)
     loss = -torch.log(overlap).mean()
     base_logp = F.log_softmax(base_logits.float(), dim=-1)
@@ -315,7 +319,7 @@ def target_overlap_loss(model, output_weight, h, target_candidates, target_ps):
         base_q = base_probs.gather(1, safe_candidates) * mask.float()
         base_overlap = torch.minimum(base_q, p).sum(dim=1).clamp_min(1e-6)
         q_mass = q.sum(dim=1)
-    return loss, base_kl, delta_norm, overlap.mean(), base_overlap.mean(), q_mass.mean()
+    return loss, base_kl, delta_norm, overlap.mean(), base_overlap.mean(), q_mass.mean(), p_mass.mean()
 
 
 def recursive_chain_loss(model, output_weight, h, y, p_min):
@@ -585,12 +589,13 @@ def eval_split(model, output_weight, static_records, accept_records, static_idx,
             )
         if len(target_frontier_idx):
             h, candidates, ps = sample_target_frontier(accept_records, target_frontier_candidates, target_frontier_ps, target_frontier_idx, args.batch_size, device, rng)
-            vals = target_overlap_loss(model, output_weight, h, candidates, ps)
+            vals = target_overlap_loss(model, output_weight, h, candidates, ps, args.target_overlap_mode == "renorm")
             out.update(
                 target_overlap_loss=float(vals[0].item()),
                 target_overlap=float(vals[3].item()),
                 target_base_overlap=float(vals[4].item()),
                 target_q_mass=float(vals[5].item()),
+                target_p_mass=float(vals[6].item()),
             )
     model.train()
     return out
@@ -629,6 +634,7 @@ def main():
     ap.add_argument("--accepted-frontier-preserve-weight", type=float, default=0.0)
     ap.add_argument("--accepted-frontier-margin", type=float, default=0.10)
     ap.add_argument("--target-overlap-weight", type=float, default=0.0, help="maximize draft probability overlap with verifier top-k candidates from MTPACC6 dumps")
+    ap.add_argument("--target-overlap-mode", choices=["renorm", "lk"], default="renorm", help="renorm matches historical top-k proxy; lk preserves missing target mass as acceptance loss")
     ap.add_argument("--base-kl-weight", type=float, default=0.02)
     ap.add_argument("--delta-norm-weight", type=float, default=0.0002)
     ap.add_argument("--p-min", type=float, default=0.1)
@@ -815,8 +821,8 @@ def main():
             )
         if args.target_overlap_weight > 0:
             h, candidates, ps = sample_target_frontier(accept_records, target_frontier_candidates, target_frontier_ps, target_frontier_idx, args.batch_size, device, rng)
-            vals = target_overlap_loss(model, output_weight, h, candidates, ps)
-            overlap_loss, base_kl, delta_norm, overlap, base_overlap, q_mass = vals
+            vals = target_overlap_loss(model, output_weight, h, candidates, ps, args.target_overlap_mode == "renorm")
+            overlap_loss, base_kl, delta_norm, overlap, base_overlap, q_mass, p_mass = vals
             loss = loss + args.target_overlap_weight * overlap_loss
             kl_terms.append(base_kl); dn_terms.append(delta_norm)
             metrics.update(
@@ -824,6 +830,7 @@ def main():
                 to=overlap.item(),
                 tbo=base_overlap.item(),
                 tq=q_mass.item(),
+                tp=p_mass.item(),
             )
         if kl_terms:
             loss = loss + args.base_kl_weight * torch.stack(kl_terms).mean()
