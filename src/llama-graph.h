@@ -773,6 +773,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
+            mtp_hidden_lora       == other.mtp_hidden_lora &&
+            mtp_hidden_lora_scale == other.mtp_hidden_lora_scale &&
             cross == other.cross;
     }
 };
