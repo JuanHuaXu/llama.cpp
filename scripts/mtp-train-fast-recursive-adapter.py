@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import bisect
 import json
 import math
 import os
@@ -167,6 +168,14 @@ def sample_accept(records, idx, token_to_local, batch_size, device, rng):
     return h, y
 
 
+def sample_accept_targets(records, target_local, idx, batch_size, device, rng):
+    chosen = rng.choice(idx, size=batch_size, replace=len(idx) < batch_size)
+    batch = records[chosen]
+    h = rows_to_h(batch, device)
+    y = torch.from_numpy(target_local[chosen].astype(np.int64)).to(device=device)
+    return h, y
+
+
 def ce_loss(model, output_weight, h, y, p_min):
     logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
     logits_f = logits.float()
@@ -199,10 +208,42 @@ def neg_gate_loss(model, output_weight, h, y, p_min):
     return loss, base_kl, delta_norm, above, mean_p
 
 
+def build_reject_correct_targets(accept_records, token_to_local):
+    if accept_records is None:
+        return np.array([], dtype=np.int64)
+
+    target_local = np.full(len(accept_records), -1, dtype=np.int64)
+    depth0_by_next_pos = {}
+    for i, row in enumerate(accept_records):
+        if int(row["depth"]) != 0:
+            continue
+        key = (int(row["seq_id"]), int(row["pos"]))
+        depth0_by_next_pos.setdefault(key, []).append((i, int(row["prev_token"])))
+
+    for row in depth0_by_next_pos.values():
+        row.sort()
+
+    for i, row in enumerate(accept_records):
+        if int(row["verified"]) != 1 or int(row["accepted"]) != 0:
+            continue
+        candidates = depth0_by_next_pos.get((int(row["seq_id"]), int(row["pos"]) + 1))
+        if not candidates:
+            continue
+        j = bisect.bisect_right(candidates, (i, 2**31 - 1))
+        if j >= len(candidates):
+            continue
+        token = candidates[j][1]
+        if 0 <= token < len(token_to_local):
+            target_local[i] = token_to_local[token]
+    return target_local
+
+
 def build_indices(static_records, accept_records, label, runtime_depth, token_to_local):
     static_idx = np.array([], dtype=np.int64)
     pos_idx = np.array([], dtype=np.int64)
     neg_idx = np.array([], dtype=np.int64)
+    corr_idx = np.array([], dtype=np.int64)
+    corr_targets = build_reject_correct_targets(accept_records, token_to_local)
     if static_records is not None:
         labels = np.asarray(static_records[label], dtype=np.int64)
         static_idx = np.nonzero((labels >= 0) & (labels < len(token_to_local)) & (token_to_local[labels] >= 0))[0]
@@ -213,10 +254,11 @@ def build_indices(static_records, accept_records, label, runtime_depth, token_to
         verified = accept_records["verified"] == 1
         pos_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 1) & in_vocab)[0]
         neg_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 0) & in_vocab)[0]
-    return static_idx, pos_idx, neg_idx
+        corr_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 0) & (corr_targets >= 0))[0]
+    return static_idx, pos_idx, neg_idx, corr_idx, corr_targets
 
 
-def eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, label, token_to_local, args, device):
+def eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, corr_targets, label, token_to_local, args, device):
     rng = np.random.default_rng(args.seed + 99)
     out = {}
     model.eval()
@@ -233,6 +275,10 @@ def eval_split(model, output_weight, static_records, accept_records, static_idx,
             h, y = sample_accept(accept_records, neg_idx, token_to_local, args.batch_size, device, rng)
             loss, _, _, above, mean_p = neg_gate_loss(model, output_weight, h, y, args.p_min)
             out.update(neg_gate=float(loss.item()), neg_above=float(above.item()), neg_p=float(mean_p.item()))
+        if len(corr_idx):
+            h, y = sample_accept_targets(accept_records, corr_targets, corr_idx, args.batch_size, device, rng)
+            ce, _, _, top1, correct_p, cont = ce_loss(model, output_weight, h, y, args.p_min)
+            out.update(corr_ce=float(ce.item()), corr_top1=float(top1.item()), corr_correct_p=float(correct_p.item()), corr_continue=float(cont.item()))
     model.train()
     return out
 
@@ -245,7 +291,7 @@ def main():
     ap.add_argument("--output-cache", default="")
     ap.add_argument("--fr-vocab", default="")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--init-adapter", required=True)
+    ap.add_argument("--init-adapter", default="")
     ap.add_argument("--runtime-depth", type=int, choices=[1, 2, 3], required=True)
     ap.add_argument("--rank", type=int, default=128)
     ap.add_argument("--batch-size", type=int, default=128)
@@ -254,6 +300,7 @@ def main():
     ap.add_argument("--static-weight", type=float, default=0.35)
     ap.add_argument("--recursive-weight", type=float, default=1.0)
     ap.add_argument("--negative-weight", type=float, default=0.35)
+    ap.add_argument("--reject-correct-weight", type=float, default=0.0)
     ap.add_argument("--base-kl-weight", type=float, default=0.02)
     ap.add_argument("--delta-norm-weight", type=float, default=0.0002)
     ap.add_argument("--p-min", type=float, default=0.1)
@@ -290,21 +337,27 @@ def main():
     output_weight = full_output_weight[torch.from_numpy(fr_ids).to(device=device)]
     norm_weight = load_norm_weight(reader, n_embd, device)
     model = LowRankHead(n_embd, args.rank, norm_weight, args.input_normalized).to(device=device, dtype=torch.float32)
-    init = torch.load(args.init_adapter, map_location="cpu", weights_only=False)
-    model.load_state_dict(init["state_dict"], strict=False)
+    if args.init_adapter:
+        init = torch.load(args.init_adapter, map_location="cpu", weights_only=False)
+        model.load_state_dict(init["state_dict"], strict=False)
+        print(json.dumps({"event": "load_init_adapter", "path": args.init_adapter}), flush=True)
+    else:
+        print(json.dumps({"event": "zero_init_adapter"}), flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     rng = np.random.default_rng(args.seed)
 
-    static_idx, pos_idx, neg_idx = build_indices(static_records, accept_records, label, args.runtime_depth, token_to_local)
+    static_idx, pos_idx, neg_idx, corr_idx, corr_targets = build_indices(static_records, accept_records, label, args.runtime_depth, token_to_local)
     if args.static_weight > 0 and len(static_idx) == 0:
         raise ValueError("static CE requested but no static rows survive the FR vocab")
     if args.recursive_weight > 0 and len(pos_idx) == 0:
         raise ValueError("recursive CE requested but no accepted recursive rows survive the FR vocab")
     if args.negative_weight > 0 and len(neg_idx) == 0:
         raise ValueError("negative gate requested but no verified rejected rows survive the FR vocab")
+    if args.reject_correct_weight > 0 and len(corr_idx) == 0:
+        raise ValueError("reject correction requested but no recoverable verified rejected rows survive the FR vocab")
 
-    print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx))}), flush=True)
-    print(json.dumps({"event": "eval_start", **eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, label, token_to_local, args, device)}), flush=True)
+    print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx)), "recursive_corr": int(len(corr_idx))}), flush=True)
+    print(json.dumps({"event": "eval_start", **eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, corr_targets, label, token_to_local, args, device)}), flush=True)
 
     t0 = time.perf_counter()
     progress = tqdm(range(1, args.steps + 1), dynamic_ncols=True)
@@ -331,6 +384,12 @@ def main():
             loss = loss + args.negative_weight * gate
             kl_terms.append(base_kl); dn_terms.append(delta_norm)
             metrics.update(ngate=gate.item(), nabove=above.item(), np=mean_p.item())
+        if args.reject_correct_weight > 0:
+            h, y = sample_accept_targets(accept_records, corr_targets, corr_idx, args.batch_size, device, rng)
+            ce, base_kl, delta_norm, top1, correct_p, cont = ce_loss(model, output_weight, h, y, args.p_min)
+            loss = loss + args.reject_correct_weight * ce
+            kl_terms.append(base_kl); dn_terms.append(delta_norm)
+            metrics.update(cce=ce.item(), ctop1=top1.item(), ccp=correct_p.item(), ccont=cont.item())
         if kl_terms:
             loss = loss + args.base_kl_weight * torch.stack(kl_terms).mean()
             loss = loss + args.delta_norm_weight * torch.stack(dn_terms).mean()
@@ -343,7 +402,7 @@ def main():
             parts = " ".join(f"{k}={v:.3f}" for k, v in metrics.items())
             progress.set_description(f"loss={loss.item():.4f} {parts}")
 
-    eval_end = eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, label, token_to_local, args, device)
+    eval_end = eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, corr_targets, label, token_to_local, args, device)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     torch.save({"format": "mtp-direct-lowrank-v1", "args": vars(args), "fr_vocab_size": int(len(fr_ids)), "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()}, "eval_end": eval_end}, args.out)
     print(json.dumps({"event": "done", "seconds": time.perf_counter() - t0, "eval_end": eval_end, "out": args.out}), flush=True)
