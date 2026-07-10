@@ -724,10 +724,14 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     GGML_ASSERT(head_norm_w && "QWEN35MOE MTP: missing both nextn.shared_head_norm and output_norm");
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 
+    const llama_adapter_lora_weight * state_lora = mtp_hidden_state_lora ? mtp_hidden_state_lora :
+        (mtp_hidden_lora_state ? mtp_hidden_lora : nullptr);
+    const float state_lora_scale = mtp_hidden_state_lora ? mtp_hidden_state_lora_scale : mtp_hidden_lora_scale;
+
     ggml_tensor * h_nextn = cur;
-    if (mtp_hidden_lora && mtp_hidden_lora_state) {
-        ggml_tensor * delta = ggml_mul_mat(ctx0, mtp_hidden_lora->b, ggml_mul_mat(ctx0, mtp_hidden_lora->a, h_nextn));
-        delta = ggml_scale(ctx0, delta, mtp_hidden_lora->get_scale(0.0f, mtp_hidden_lora_scale));
+    if (state_lora) {
+        ggml_tensor * delta = ggml_mul_mat(ctx0, state_lora->b, ggml_mul_mat(ctx0, state_lora->a, h_nextn));
+        delta = ggml_scale(ctx0, delta, state_lora->get_scale(0.0f, state_lora_scale));
         h_nextn = ggml_add(ctx0, h_nextn, delta);
         cb(h_nextn, "mtp_hidden_lora_state", -1);
     }

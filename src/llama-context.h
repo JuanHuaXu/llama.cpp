@@ -117,6 +117,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_mtp_hidden_lora(llama_adapter_lora * adapter, float scale);
+    void set_mtp_hidden_state_lora(llama_adapter_lora * adapter, float scale);
     void set_mtp_hidden_lora_state(bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -282,7 +283,9 @@ private:
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
     llama_adapter_lora_weight * mtp_hidden_lora = nullptr;
+    llama_adapter_lora_weight * mtp_hidden_state_lora = nullptr;
     float mtp_hidden_lora_scale = 1.0f;
+    float mtp_hidden_state_lora_scale = 1.0f;
     bool mtp_hidden_lora_state = false;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably

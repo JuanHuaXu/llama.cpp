@@ -3897,6 +3897,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LORA_DEPTH3"));
     add_opt(common_arg(
+        {"--spec-mtp-state-lora-depth1"}, "FNAME",
+        "draft-only LoRA adapter to apply to recursive MTP hidden state at draft depth 1",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_state_lora_depth[0] = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STATE_LORA_DEPTH1"));
+    add_opt(common_arg(
+        {"--spec-mtp-state-lora-depth2"}, "FNAME",
+        "draft-only LoRA adapter to apply to recursive MTP hidden state at draft depth 2",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_state_lora_depth[1] = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STATE_LORA_DEPTH2"));
+    add_opt(common_arg(
+        {"--spec-mtp-state-lora-depth3"}, "FNAME",
+        "draft-only LoRA adapter to apply to recursive MTP hidden state at draft depth 3",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_state_lora_depth[2] = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STATE_LORA_DEPTH3"));
+    add_opt(common_arg(
+        {"--spec-mtp-state-lora-scale-depth1"}, "SCALE",
+        "scale for the recursive MTP hidden-state LoRA at draft depth 1 (default: 1.0)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_state_lora_scale_depth[0] = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STATE_LORA_SCALE_DEPTH1"));
+    add_opt(common_arg(
+        {"--spec-mtp-state-lora-scale-depth2"}, "SCALE",
+        "scale for the recursive MTP hidden-state LoRA at draft depth 2 (default: 1.0)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_state_lora_scale_depth[1] = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STATE_LORA_SCALE_DEPTH2"));
+    add_opt(common_arg(
+        {"--spec-mtp-state-lora-scale-depth3"}, "SCALE",
+        "scale for the recursive MTP hidden-state LoRA at draft depth 3 (default: 1.0)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_state_lora_scale_depth[2] = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STATE_LORA_SCALE_DEPTH3"));
+    add_opt(common_arg(
         {"--spec-mtp-lora-state"},
         {"--no-spec-mtp-lora-state"},
         string_format("apply MTP hidden LoRA before exporting h_nextn so it steers recursive state (default: %s)",

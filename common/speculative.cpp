@@ -1316,6 +1316,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool     mtp_state_dump_finished = false;
     std::vector<llama_adapter_lora_ptr> mtp_lora_storage;
     llama_adapter_lora * mtp_lora_depth[3] = { nullptr, nullptr, nullptr };
+    llama_adapter_lora * mtp_state_lora_depth[3] = { nullptr, nullptr, nullptr };
+    float mtp_state_lora_scale_depth[3] = { 1.0f, 1.0f, 1.0f };
     int32_t  mtp_lora_active_depth = -2;
 
     struct mtp_state_head {
@@ -1947,19 +1949,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_model * model_dft = const_cast<llama_model *>(llama_get_model(ctx_dft));
         for (int i = 0; i < 3; ++i) {
             const std::string & path = params.mtp_lora_depth[i];
-            if (path.empty()) {
-                continue;
+            if (!path.empty()) {
+                llama_adapter_lora_ptr lora;
+                lora.reset(llama_adapter_lora_init(model_dft, path.c_str()));
+                if (lora == nullptr) {
+                    throw std::runtime_error("failed to load MTP draft LoRA adapter: " + path);
+                }
+
+                mtp_lora_depth[i] = lora.get();
+                mtp_lora_storage.emplace_back(std::move(lora));
+                SPC_INF("MTP draft LoRA depth %d enabled: path='%s'\n", i + 1, path.c_str());
             }
 
-            llama_adapter_lora_ptr lora;
-            lora.reset(llama_adapter_lora_init(model_dft, path.c_str()));
-            if (lora == nullptr) {
-                throw std::runtime_error("failed to load MTP draft LoRA adapter: " + path);
-            }
+            const std::string & state_path = params.mtp_state_lora_depth[i];
+            if (!state_path.empty()) {
+                llama_adapter_lora_ptr lora;
+                lora.reset(llama_adapter_lora_init(model_dft, state_path.c_str()));
+                if (lora == nullptr) {
+                    throw std::runtime_error("failed to load MTP state LoRA adapter: " + state_path);
+                }
 
-            mtp_lora_depth[i] = lora.get();
-            mtp_lora_storage.emplace_back(std::move(lora));
-            SPC_INF("MTP draft LoRA depth %d enabled: path='%s'\n", i + 1, path.c_str());
+                mtp_state_lora_depth[i] = lora.get();
+                mtp_state_lora_scale_depth[i] = params.mtp_state_lora_scale_depth[i];
+                mtp_lora_storage.emplace_back(std::move(lora));
+                SPC_INF("MTP state LoRA depth %d enabled: path='%s', scale=%.3f\n",
+                        i + 1, state_path.c_str(), mtp_state_lora_scale_depth[i]);
+            }
         }
     }
 
@@ -1977,6 +1992,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_set_mtp_hidden_lora(ctx_dft, mtp_lora_depth[depth], 1.0f);
         } else {
             llama_set_mtp_hidden_lora(ctx_dft, nullptr, 1.0f);
+        }
+        if (depth >= 0 && depth < 3 && mtp_state_lora_depth[depth] != nullptr) {
+            llama_set_mtp_hidden_state_lora(ctx_dft, mtp_state_lora_depth[depth], mtp_state_lora_scale_depth[depth]);
+        } else {
+            llama_set_mtp_hidden_state_lora(ctx_dft, nullptr, 1.0f);
         }
         mtp_lora_active_depth = depth;
     }
