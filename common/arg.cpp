@@ -3897,6 +3897,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LORA_DEPTH3"));
     add_opt(common_arg(
+        {"--spec-mtp-output-lora-depth1"}, "FNAME",
+        "draft-only output.weight LoRA adapter to apply for MTP draft depth 1",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_output_lora_depth[0] = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_OUTPUT_LORA_DEPTH1"));
+    add_opt(common_arg(
+        {"--spec-mtp-output-lora-depth2"}, "FNAME",
+        "draft-only output.weight LoRA adapter to apply for MTP draft depth 2",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_output_lora_depth[1] = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_OUTPUT_LORA_DEPTH2"));
+    add_opt(common_arg(
+        {"--spec-mtp-output-lora-depth3"}, "FNAME",
+        "draft-only output.weight LoRA adapter to apply for MTP draft depth 3",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_output_lora_depth[2] = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_OUTPUT_LORA_DEPTH3"));
+    add_opt(common_arg(
         {"--spec-mtp-state-lora-depth1"}, "FNAME",
         "draft-only LoRA adapter to apply to recursive MTP hidden state at draft depth 1",
         [](common_params & params, const std::string & value) {

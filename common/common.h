@@ -354,7 +354,8 @@ struct common_params_speculative_draft {
     uint32_t mtp_engram_min_hits = 2; // observations before layer ratings can authorize draft-cache reuse
     float mtp_engram_min_accept = 0.75f; // minimum engram acceptance EMA for cached draft reuse
 
-    std::string mtp_lora_depth[3]; // optional draft-only LoRA adapters for MTP depths 1..3
+    std::string mtp_lora_depth[3]; // optional draft-only hidden LoRA adapters for MTP depths 1..3
+    std::string mtp_output_lora_depth[3]; // optional draft-only output.weight LoRA adapters for MTP depths 1..3
     std::string mtp_state_lora_depth[3]; // optional draft-only LoRA adapters for recursive MTP hidden state at depths 1..3
     float mtp_state_lora_scale_depth[3] = { 1.0f, 1.0f, 1.0f }; // scales for recursive MTP hidden-state LoRAs
     bool mtp_lora_state = false; // apply MTP hidden LoRA to recursive h_nextn instead of logits only

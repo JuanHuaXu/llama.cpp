@@ -1316,8 +1316,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool     mtp_state_dump_finished = false;
     std::vector<llama_adapter_lora_ptr> mtp_lora_storage;
     llama_adapter_lora * mtp_lora_depth[3] = { nullptr, nullptr, nullptr };
+    llama_adapter_lora * mtp_output_lora_depth[3] = { nullptr, nullptr, nullptr };
     llama_adapter_lora * mtp_state_lora_depth[3] = { nullptr, nullptr, nullptr };
     float mtp_state_lora_scale_depth[3] = { 1.0f, 1.0f, 1.0f };
+    bool mtp_output_lora_configured = false;
     int32_t  mtp_lora_active_depth = -2;
 
     struct mtp_state_head {
@@ -2044,6 +2046,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 SPC_INF("MTP draft LoRA depth %d enabled: path='%s'\n", i + 1, path.c_str());
             }
 
+            const std::string & output_path = params.mtp_output_lora_depth[i];
+            if (!output_path.empty()) {
+                llama_adapter_lora_ptr lora;
+                lora.reset(llama_adapter_lora_init(model_dft, output_path.c_str()));
+                if (lora == nullptr) {
+                    throw std::runtime_error("failed to load MTP output LoRA adapter: " + output_path);
+                }
+
+                mtp_output_lora_depth[i] = lora.get();
+                mtp_output_lora_configured = true;
+                mtp_lora_storage.emplace_back(std::move(lora));
+                SPC_INF("MTP output LoRA depth %d enabled: path='%s'\n", i + 1, output_path.c_str());
+            }
+
             const std::string & state_path = params.mtp_state_lora_depth[i];
             if (!state_path.empty()) {
                 llama_adapter_lora_ptr lora;
@@ -2075,6 +2091,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_set_mtp_hidden_lora(ctx_dft, mtp_lora_depth[depth], 1.0f);
         } else {
             llama_set_mtp_hidden_lora(ctx_dft, nullptr, 1.0f);
+        }
+        if (mtp_output_lora_configured) {
+            if (depth >= 0 && depth < 3 && mtp_output_lora_depth[depth] != nullptr) {
+                llama_adapter_lora * adapters[] = { mtp_output_lora_depth[depth] };
+                float scales[] = { 1.0f };
+                llama_set_adapters_lora(ctx_dft, adapters, 1, scales);
+            } else {
+                llama_set_adapters_lora(ctx_dft, nullptr, 0, nullptr);
+            }
         }
         if (depth >= 0 && depth < 3 && mtp_state_lora_depth[depth] != nullptr) {
             llama_set_mtp_hidden_state_lora(ctx_dft, mtp_state_lora_depth[depth], mtp_state_lora_scale_depth[depth]);
