@@ -3897,6 +3897,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LORA_DEPTH3"));
     add_opt(common_arg(
+        {"--spec-mtp-state-head"}, "FNAME",
+        "direct-state head used to steer draft-MTP hidden rows between drafted tokens",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_state_head = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STATE_HEAD"));
+    add_opt(common_arg(
+        {"--spec-mtp-state-head-scale"}, "P",
+        "blend factor for --spec-mtp-state-head hidden steering (default: 1.0)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_state_head_scale = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STATE_HEAD_SCALE"));
+    add_opt(common_arg(
         {"--spec-mtp-fr-vocab"}, "FNAME",
         "frequency-ranked token allowlist for draft-MTP candidate selection",
         [](common_params & params, const std::string & value) {

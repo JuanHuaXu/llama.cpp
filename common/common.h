@@ -355,6 +355,8 @@ struct common_params_speculative_draft {
     float mtp_engram_min_accept = 0.75f; // minimum engram acceptance EMA for cached draft reuse
 
     std::string mtp_lora_depth[3]; // optional draft-only LoRA adapters for MTP depths 1..3
+    std::string mtp_state_head; // optional direct-state head used to steer draft-MTP hidden rows
+    float mtp_state_head_scale = 1.0f; // blend factor for direct-state hidden steering
 
     std::string mtp_fr_vocab; // optional frequency-ranked token allowlist for MTP drafting
     uint32_t mtp_fr_top_k = 256; // sampler candidates scanned when the allowlist is active

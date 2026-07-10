@@ -1317,6 +1317,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<llama_adapter_lora_ptr> mtp_lora_storage;
     llama_adapter_lora * mtp_lora_depth[3] = { nullptr, nullptr, nullptr };
     int32_t  mtp_lora_active_depth = -2;
+
+    struct mtp_state_head {
+        uint32_t n_embd = 0;
+        uint32_t rank = 0;
+        uint32_t n_vocab = 0;
+        uint32_t flags = 0;
+        float scale = 1.0f;
+        std::vector<float> hnorm;
+        std::vector<float> down_h;
+        std::vector<float> up;
+        std::vector<float> skip;
+        std::vector<float> token_down;
+        std::vector<float> h_norm;
+        std::vector<float> r;
+        uint64_t calls = 0;
+        uint64_t steered = 0;
+
+        bool ready() const {
+            return n_embd > 0 && rank > 0 && n_vocab > 0;
+        }
+
+        bool identity_skip() const {
+            return (flags & 1u) != 0;
+        }
+    };
+    mtp_state_head mtp_state;
+    std::vector<std::vector<float>> mtp_state_steered_h;
+
     uint64_t mtp_dump_records  = 0;
     bool     mtp_dump_finished = false;
     uint32_t accept_updates      = 0;
@@ -1430,6 +1458,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
         mtp_accept_pending.assign(n_seq, {});
         mtp_draft_input_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        mtp_state_steered_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
         mtp_draft_cache_active.assign(n_seq, {});
         mtp_engram_current_key.assign(n_seq, 0);
         mtp_engram_current_valid.assign(n_seq, false);
@@ -1460,6 +1489,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         init_mtp_accept_dump();
         init_mtp_state_dump();
         init_mtp_loras();
+        init_mtp_state_head();
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1948,6 +1978,136 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_set_mtp_hidden_lora(ctx_dft, nullptr, 1.0f);
         }
         mtp_lora_active_depth = depth;
+    }
+
+    template <typename T>
+    static bool mtp_state_read_scalar(std::istream & in, T & value) {
+        in.read(reinterpret_cast<char *>(&value), sizeof(value));
+        return in.good();
+    }
+
+    static bool mtp_state_read_f32(std::istream & in, std::vector<float> & dst, size_t n) {
+        dst.resize(n);
+        in.read(reinterpret_cast<char *>(dst.data()), (std::streamsize) (n * sizeof(float)));
+        return in.good();
+    }
+
+    void init_mtp_state_head() {
+        if (params.mtp_state_head.empty()) {
+            return;
+        }
+
+        std::ifstream in(params.mtp_state_head, std::ios::binary);
+        if (!in.is_open()) {
+            throw std::runtime_error("failed to open MTP direct-state head: " + params.mtp_state_head);
+        }
+
+        char magic[8] = {};
+        uint32_t version = 0;
+        uint32_t file_n_embd = 0;
+        uint32_t rank = 0;
+        uint32_t n_vocab = 0;
+        uint32_t flags = 0;
+        float model_scale = 0.0f;
+        in.read(magic, sizeof(magic));
+        if (!in.good() ||
+                memcmp(magic, "MTPDSH1", 8) != 0 ||
+                !mtp_state_read_scalar(in, version) ||
+                !mtp_state_read_scalar(in, file_n_embd) ||
+                !mtp_state_read_scalar(in, rank) ||
+                !mtp_state_read_scalar(in, n_vocab) ||
+                !mtp_state_read_scalar(in, flags) ||
+                !mtp_state_read_scalar(in, model_scale)) {
+            throw std::runtime_error("invalid MTP direct-state head header: " + params.mtp_state_head);
+        }
+        if (version != 1 || file_n_embd != (uint32_t) n_embd || rank == 0 || n_vocab == 0 || (flags & ~1u) != 0) {
+            throw std::runtime_error("unsupported MTP direct-state head shape: " + params.mtp_state_head);
+        }
+
+        mtp_state.n_embd = file_n_embd;
+        mtp_state.rank = rank;
+        mtp_state.n_vocab = n_vocab;
+        mtp_state.flags = flags;
+        mtp_state.scale = model_scale;
+        if (!mtp_state_read_f32(in, mtp_state.hnorm, n_embd) ||
+                !mtp_state_read_f32(in, mtp_state.down_h, (size_t) rank * n_embd) ||
+                !mtp_state_read_f32(in, mtp_state.up, (size_t) n_embd * rank)) {
+            throw std::runtime_error("truncated MTP direct-state head: " + params.mtp_state_head);
+        }
+        if (!mtp_state.identity_skip() && !mtp_state_read_f32(in, mtp_state.skip, (size_t) n_embd * n_embd)) {
+            throw std::runtime_error("truncated MTP direct-state head skip matrix: " + params.mtp_state_head);
+        }
+        if (!mtp_state_read_f32(in, mtp_state.token_down, (size_t) n_vocab * rank)) {
+            throw std::runtime_error("truncated MTP direct-state head token table: " + params.mtp_state_head);
+        }
+        mtp_state.h_norm.assign(n_embd, 0.0f);
+        mtp_state.r.assign(rank, 0.0f);
+
+        SPC_INF("MTP direct-state head enabled: path='%s', n_embd=%u, rank=%u, vocab=%u, scale=%.3f, blend=%.3f, identity_skip=%d\n",
+                params.mtp_state_head.c_str(), file_n_embd, rank, n_vocab,
+                (double) model_scale, (double) params.mtp_state_head_scale, (int) mtp_state.identity_skip());
+    }
+
+    bool apply_mtp_state_head(llama_token token, const float * h_in, const float * h_base, float * h_out) {
+        if (!mtp_state.ready() || h_in == nullptr || h_base == nullptr || h_out == nullptr) {
+            return false;
+        }
+        const float blend = std::max(0.0f, std::min(1.0f, params.mtp_state_head_scale));
+        if (blend <= 0.0f) {
+            return false;
+        }
+        ++mtp_state.calls;
+        if (token < 0 || (uint32_t) token >= mtp_state.n_vocab) {
+            return false;
+        }
+
+        const uint32_t n = mtp_state.n_embd;
+        const uint32_t rnk = mtp_state.rank;
+        float mean_sq = 0.0f;
+        for (uint32_t i = 0; i < n; ++i) {
+            const float v = std::isfinite(h_in[i]) ? h_in[i] : 0.0f;
+            mean_sq += v * v;
+        }
+        const float inv_rms = 1.0f / std::sqrt(mean_sq / (float) n + 1.0e-6f);
+        for (uint32_t i = 0; i < n; ++i) {
+            mtp_state.h_norm[i] = h_in[i] * inv_rms * mtp_state.hnorm[i];
+        }
+
+        const float * token_r = mtp_state.token_down.data() + (size_t) token * rnk;
+        for (uint32_t r = 0; r < rnk; ++r) {
+            const float * w = mtp_state.down_h.data() + (size_t) r * n;
+            float acc = token_r[r];
+            for (uint32_t i = 0; i < n; ++i) {
+                acc += w[i] * mtp_state.h_norm[i];
+            }
+            mtp_state.r[r] = acc;
+        }
+
+        const float keep = 1.0f - blend;
+        for (uint32_t i = 0; i < n; ++i) {
+            const float * up = mtp_state.up.data() + (size_t) i * rnk;
+            float pred = mtp_state.h_norm[i];
+            if (!mtp_state.identity_skip()) {
+                const float * skip = mtp_state.skip.data() + (size_t) i * n;
+                pred = 0.0f;
+                for (uint32_t j = 0; j < n; ++j) {
+                    pred += skip[j] * mtp_state.h_norm[j];
+                }
+            }
+            float delta = 0.0f;
+            for (uint32_t r = 0; r < rnk; ++r) {
+                delta += up[r] * mtp_state.r[r];
+            }
+            pred += delta * mtp_state.scale;
+            h_out[i] = keep * h_base[i] + blend * pred;
+        }
+
+        ++mtp_state.steered;
+        if (mtp_state.steered == 1 || mtp_state.steered % 512 == 0) {
+            SPC_INF("MTP direct-state head steered rows=%" PRIu64 " calls=%" PRIu64 "\n",
+                    mtp_state.steered, mtp_state.calls);
+        }
+        return true;
     }
 
     template <typename T>
@@ -2972,6 +3132,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
+                const float * h_next = h_row;
+                if (seq_id >= 0 && seq_id < (llama_seq_id) mtp_state_steered_h.size() &&
+                        apply_mtp_state_head(prev_token, h_in, h_row, mtp_state_steered_h[seq_id].data())) {
+                    h_next = mtp_state_steered_h[seq_id].data();
+                }
 
                 if (n_max_eff <= (int) result.size() || (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
@@ -2981,7 +3146,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
-                    chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
+                    chain_h[seq_id].insert(chain_h[seq_id].end(), h_next, h_next + n_embd);
 
                     const int n_rows = (int) result.size() + 1; // id_last + tokens drafted so far
                     for (int t = 0; t < n_rows; ++t) {
@@ -2994,14 +3159,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
                     common_batch_add(batch, id, dp.n_past, { seq_id }, true);
-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_next, row_bytes);
                 } else {
                     common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_next, row_bytes);
                 }
 
                 if (seq_id >= 0 && seq_id < (llama_seq_id) mtp_draft_input_h.size()) {
-                    mtp_draft_input_h[seq_id].assign(h_row, h_row + n_embd);
+                    mtp_draft_input_h[seq_id].assign(h_next, h_next + n_embd);
                 }
                 i_last[seq_id] = batch.n_tokens - 1;
             }
