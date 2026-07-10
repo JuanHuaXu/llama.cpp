@@ -1252,6 +1252,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_token prev_token  = 0;
         llama_token draft_token = 0;
         int32_t     depth       = 0;
+        int32_t     row_type    = 0; // 0=draft attempt, 1=confidence stop before drafting.
         float       p           = 0.0f;
         float       h_in_scale  = 1.0f;
         float       h_scale     = 1.0f;
@@ -2115,7 +2116,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     static constexpr uint32_t mtp_accept_dump_header_bytes = 32;
-    static constexpr uint32_t mtp_accept_dump_meta_bytes = 56;
+    static constexpr uint32_t mtp_accept_dump_meta_bytes = 60;
     static constexpr uint32_t mtp_accept_dump_format_q8_row_scale = 1;
     static constexpr uint32_t mtp_state_dump_meta_bytes = 56;
     static constexpr uint32_t mtp_state_dump_format_q8_pair_scale = 1;
@@ -2225,8 +2226,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        const char magic[8] = { 'M', 'T', 'P', 'A', 'C', 'C', '3', '\0' };
-        const uint32_t version = 3;
+        const char magic[8] = { 'M', 'T', 'P', 'A', 'C', 'C', '4', '\0' };
+        const uint32_t version = 4;
 
         if (params.mtp_accept_dump_append && init_mtp_accept_dump_append(magic, version)) {
             return;
@@ -2343,7 +2344,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             int32_t depth,
             float p,
             const float * h_in,
-            const float * h) {
+            const float * h,
+            int32_t row_type = 0) {
         if (((!mtp_accept_dump.is_open() || mtp_accept_dump_finished) &&
                     (!mtp_state_dump.is_open() || mtp_state_dump_finished)) || h == nullptr ||
                 seq_id < 0 || seq_id >= (llama_seq_id) mtp_accept_pending.size()) {
@@ -2355,6 +2357,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         attempt.prev_token = prev_token;
         attempt.draft_token = draft_token;
         attempt.depth = depth;
+        attempt.row_type = row_type;
         attempt.p = p;
         attempt.h_in_scale = quantize_hidden_row_q8(h_in, attempt.h_in_q8);
         attempt.h_scale = quantize_hidden_row_q8(h, attempt.h_q8);
@@ -2370,16 +2373,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         auto & attempts = mtp_accept_pending[seq_id];
-        const int32_t n_drafted = (int32_t) attempts.size();
+        int32_t n_drafted = 0;
+        for (const auto & a : attempts) {
+            if (a.row_type == 0) {
+                ++n_drafted;
+            }
+        }
         const int32_t n_acc = std::min<int32_t>(n_accepted, n_drafted);
         const uint64_t batch_id = mtp_accept_batch_id++;
+        int32_t draft_idx = 0;
 
-        for (int32_t i = 0; i < n_drafted; ++i) {
+        for (int32_t i = 0; i < (int32_t) attempts.size(); ++i) {
             finish_mtp_accept_dump_if_needed();
 
             const auto & a = attempts[i];
-            const int32_t accepted = i < n_acc ? 1 : 0;
-            const int32_t verified = i <= n_acc ? 1 : 0; // after the first rejection, later chain tokens were never target-verified.
+            const bool is_draft = a.row_type == 0;
+            const int32_t accepted = is_draft && draft_idx < n_acc ? 1 : 0;
+            const int32_t verified = is_draft && draft_idx <= n_acc ? 1 : 0; // after the first rejection, later chain tokens were never target-verified.
             const int32_t row_target = accepted ? (int32_t) a.draft_token : (verified ? (int32_t) target_token : -1);
             const float prob = std::isfinite(a.p) ? a.p : 0.0f;
 
@@ -2396,6 +2406,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 mtp_accept_dump_write_scalar(n_acc);
                 mtp_accept_dump_write_scalar(n_drafted);
                 mtp_accept_dump_write_scalar(row_target);
+                mtp_accept_dump_write_scalar(a.row_type);
                 mtp_accept_dump_write_scalar(a.h_scale);
                 mtp_accept_dump.write(reinterpret_cast<const char *>(a.h_q8.data()), a.h_q8.size());
 
@@ -2411,7 +2422,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             finish_mtp_state_dump_if_needed();
-            if (mtp_state_dump.is_open() && !mtp_state_dump_finished) {
+            if (is_draft && mtp_state_dump.is_open() && !mtp_state_dump_finished) {
                 mtp_state_dump_write_scalar(batch_id);
                 mtp_state_dump_write_scalar((int32_t) seq_id);
                 mtp_state_dump_write_scalar((int32_t) a.pos);
@@ -2437,6 +2448,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 ++mtp_state_dump_records;
+            }
+            if (is_draft) {
+                ++draft_idx;
             }
         }
 
@@ -2882,6 +2896,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // only collect sufficiently confident draft tokens
                 if (id == LLAMA_TOKEN_NULL || p_draft < params.p_min) {
+                    const llama_token prev_token = dp.result->empty() ? dp.id_last : dp.result->back();
+                    const llama_token top_id = cur_p->size > 0 ? cur_p->data[0].id : LLAMA_TOKEN_NULL;
+                    const float top_p = cur_p->size > 0 && std::isfinite(cur_p->data[0].p) ? cur_p->data[0].p : p_draft;
+                    const float * h_in = seq_id >= 0 && seq_id < (llama_seq_id) mtp_draft_input_h.size()
+                        ? mtp_draft_input_h[seq_id].data()
+                        : nullptr;
+                    add_mtp_accept_attempt(seq_id, dp.n_past + (llama_pos) dp.result->size() + 1, prev_token, top_id, i, top_p, h_in, h_row, 1);
+
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -2937,6 +2959,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             ++i;
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) mtp_accept_pending.size(); ++seq_id) {
+            const auto & pending = mtp_accept_pending[seq_id];
+            if (pending.empty()) {
+                continue;
+            }
+            bool has_draft = false;
+            for (const auto & row : pending) {
+                has_draft = has_draft || row.row_type == 0;
+            }
+            if (!has_draft) {
+                dump_mtp_accept_records(seq_id, 0, LLAMA_TOKEN_NULL);
+            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

@@ -40,7 +40,11 @@ def read_accept_header(path):
     with open(path, "rb") as f:
         header = f.read(32)
     magic, version, n_embd, meta, fmt, limit = struct.unpack("<8sIIIIQ", header)
-    if not ((magic == b"MTPACC2\0" and version == 2 and meta == 52) or (magic == b"MTPACC3\0" and version == 3 and meta == 56)) or fmt != 1:
+    if not (
+        (magic == b"MTPACC2\0" and version == 2 and meta == 52)
+        or (magic == b"MTPACC3\0" and version == 3 and meta == 56)
+        or (magic == b"MTPACC4\0" and version == 4 and meta == 60)
+    ) or fmt != 1:
         raise ValueError(f"unsupported accept dump: magic={magic!r} version={version} fmt={fmt} meta={meta}")
     records = (os.path.getsize(path) - 32) // (meta + n_embd)
     return {"n_embd": n_embd, "records": records, "version": version, "meta": meta}
@@ -54,6 +58,8 @@ def open_accept(path, header):
     ]
     if header["version"] >= 3:
         fields.append(("target_token", "<i4"))
+    if header["version"] >= 4:
+        fields.append(("row_type", "<i4"))
     fields.extend([("scale", "<f4"), ("q", "i1", (header["n_embd"],))])
     dtype = np.dtype(fields)
     return np.memmap(path, mode="r", dtype=dtype, offset=32, shape=(header["records"],))
@@ -362,12 +368,13 @@ def build_indices(static_records, accept_records, label, runtime_depth, token_to
     if accept_records is not None:
         toks = np.asarray(accept_records["draft_token"], dtype=np.int64)
         in_vocab = (toks >= 0) & (toks < len(token_to_local)) & (token_to_local[toks] >= 0)
+        row_type_mask = accept_records["row_type"] == 0 if "row_type" in accept_records.dtype.names else np.ones(len(accept_records), dtype=bool)
         depth_mask = accept_records["depth"] == (runtime_depth - 1)
         verified = accept_records["verified"] == 1
-        pos_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 1) & in_vocab)[0]
-        neg_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 0) & in_vocab)[0]
+        pos_idx = np.nonzero(row_type_mask & depth_mask & verified & (accept_records["accepted"] == 1) & in_vocab)[0]
+        neg_idx = np.nonzero(row_type_mask & depth_mask & verified & (accept_records["accepted"] == 0) & in_vocab)[0]
         draft_local = token_to_local[toks]
-        corr_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 0) & (corr_targets >= 0) & (draft_local >= 0))[0]
+        corr_idx = np.nonzero(row_type_mask & depth_mask & verified & (accept_records["accepted"] == 0) & (corr_targets >= 0) & (draft_local >= 0))[0]
     pos_weights = accepted_chain_weights(accept_records, pos_idx, runtime_depth, chain_bonus, chain_power) if accept_records is not None else None
     return static_idx, pos_idx, neg_idx, corr_idx, corr_targets, pos_weights
 
