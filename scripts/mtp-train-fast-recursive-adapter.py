@@ -186,16 +186,22 @@ def sample_accept(records, idx, token_to_local, batch_size, device, rng, weights
     return h, y
 
 
-def sample_accept_targets(records, target_local, idx, batch_size, device, rng):
-    chosen = rng.choice(idx, size=batch_size, replace=len(idx) < batch_size)
+def sample_accept_targets(records, target_local, idx, batch_size, device, rng, weights=None):
+    p = None
+    if weights is not None:
+        p = weights / weights.sum()
+    chosen = rng.choice(idx, size=batch_size, replace=len(idx) < batch_size, p=p)
     batch = records[chosen]
     h = rows_to_h(batch, device)
     y = torch.from_numpy(target_local[chosen].astype(np.int64)).to(device=device)
     return h, y
 
 
-def sample_accept_target_pairs(records, target_local, token_to_local, idx, batch_size, device, rng):
-    chosen = rng.choice(idx, size=batch_size, replace=len(idx) < batch_size)
+def sample_accept_target_pairs(records, target_local, token_to_local, idx, batch_size, device, rng, weights=None):
+    p = None
+    if weights is not None:
+        p = weights / weights.sum()
+    chosen = rng.choice(idx, size=batch_size, replace=len(idx) < batch_size, p=p)
     batch = records[chosen]
     h = rows_to_h(batch, device)
     correct = torch.from_numpy(target_local[chosen].astype(np.int64)).to(device=device)
@@ -412,16 +418,38 @@ def build_reject_correct_targets(accept_records, token_to_local):
     return target_local
 
 
-def accepted_chain_weights(accept_records, pos_idx, runtime_depth, bonus, power):
-    if len(pos_idx) == 0 or (bonus <= 0 and power <= 0):
+def accepted_chain_weights(accept_records, pos_idx, runtime_depth, bonus, power, utility_bonus, utility_power):
+    if len(pos_idx) == 0 or (bonus <= 0 and power <= 0 and utility_bonus <= 0 and utility_power <= 0):
         return None
     n_acc = np.asarray(accept_records[pos_idx]["n_accepted"], dtype=np.float32)
-    survival = np.maximum(n_acc - runtime_depth, 0.0)
+    extra_survival = np.maximum(n_acc - runtime_depth, 0.0)
+    accepted_utility = np.maximum(n_acc - runtime_depth + 1.0, 1.0)
     weights = np.ones(len(pos_idx), dtype=np.float64)
     if bonus > 0:
-        weights *= 1.0 + bonus * survival
+        weights *= 1.0 + bonus * extra_survival
     if power > 0:
         weights *= np.maximum(n_acc / float(runtime_depth), 1.0) ** power
+    if utility_bonus > 0:
+        weights *= 1.0 + utility_bonus * accepted_utility
+    if utility_power > 0:
+        weights *= accepted_utility ** utility_power
+    total = weights.sum()
+    if not np.isfinite(total) or total <= 0:
+        return None
+    return weights
+
+
+def rejected_chain_weights(accept_records, idx, bonus, power):
+    if len(idx) == 0 or (bonus <= 0 and power <= 0):
+        return None
+    depth = np.asarray(accept_records[idx]["depth"], dtype=np.float32)
+    n_drafted = np.asarray(accept_records[idx]["n_drafted"], dtype=np.float32)
+    wasted = np.maximum(n_drafted - depth, 1.0)
+    weights = np.ones(len(idx), dtype=np.float64)
+    if bonus > 0:
+        weights *= 1.0 + bonus * wasted
+    if power > 0:
+        weights *= wasted ** power
     total = weights.sum()
     if not np.isfinite(total) or total <= 0:
         return None
@@ -499,7 +527,7 @@ def build_target_frontier_indices(accept_records, token_to_local, runtime_depth)
     return idx, local, ps
 
 
-def build_indices(static_records, accept_records, label, runtime_depth, token_to_local, chain_bonus=0.0, chain_power=0.0, candidate_rank_max=0):
+def build_indices(static_records, accept_records, label, runtime_depth, token_to_local, chain_bonus=0.0, chain_power=0.0, chain_utility_bonus=0.0, chain_utility_power=0.0, reject_utility_bonus=0.0, reject_utility_power=0.0, candidate_rank_max=0):
     static_idx = np.array([], dtype=np.int64)
     pos_idx = np.array([], dtype=np.int64)
     neg_idx = np.array([], dtype=np.int64)
@@ -529,8 +557,10 @@ def build_indices(static_records, accept_records, label, runtime_depth, token_to
         candidate_idx = build_candidate_frontier_indices(accept_records, corr_targets, token_to_local, runtime_depth, candidate_rank_max)
         preserve_idx, preserve_targets = build_accepted_frontier_preserve(accept_records, token_to_local, runtime_depth)
         target_frontier_idx, target_frontier_candidates, target_frontier_ps = build_target_frontier_indices(accept_records, token_to_local, runtime_depth)
-    pos_weights = accepted_chain_weights(accept_records, pos_idx, runtime_depth, chain_bonus, chain_power) if accept_records is not None else None
-    return static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, pos_weights
+    pos_weights = accepted_chain_weights(accept_records, pos_idx, runtime_depth, chain_bonus, chain_power, chain_utility_bonus, chain_utility_power) if accept_records is not None else None
+    corr_weights = rejected_chain_weights(accept_records, corr_idx, reject_utility_bonus, reject_utility_power) if accept_records is not None else None
+    candidate_weights = rejected_chain_weights(accept_records, candidate_idx, reject_utility_bonus, reject_utility_power) if accept_records is not None else None
+    return static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, pos_weights, corr_weights, candidate_weights
 
 
 def eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, label, token_to_local, args, device):
@@ -621,13 +651,17 @@ def main():
     ap.add_argument("--recursive-top-confidence-weight", type=float, default=0.0)
     ap.add_argument("--recursive-correct-margin-weight", type=float, default=0.0)
     ap.add_argument("--accepted-teacher-kl-weight", type=float, default=0.0, help="anchor accepted recursive rows to the initialized adapter distribution")
-    ap.add_argument("--accepted-chain-bonus", type=float, default=0.0, help="oversample accepted recursive rows that came from longer accepted chains")
+    ap.add_argument("--accepted-chain-bonus", type=float, default=0.0, help="legacy oversampling for accepted recursive rows beyond runtime_depth")
     ap.add_argument("--accepted-chain-power", type=float, default=0.0, help="power-law oversampling by n_accepted/runtime_depth for accepted recursive rows")
+    ap.add_argument("--accepted-chain-utility-bonus", type=float, default=0.0, help="oversample accepted recursive rows by accepted tokens saved at this depth, including exact-depth successes")
+    ap.add_argument("--accepted-chain-utility-power", type=float, default=0.0, help="power-law oversampling by accepted tokens saved at this depth")
     ap.add_argument("--negative-weight", type=float, default=0.35)
     ap.add_argument("--reject-correct-weight", type=float, default=0.0)
     ap.add_argument("--reject-rank-flip-weight", type=float, default=0.0)
     ap.add_argument("--reject-rank-margin", type=float, default=0.25)
     ap.add_argument("--reject-rank-max", type=int, default=20, help="only rank-flip rejects whose verifier token is within this base local-vocab rank; <=0 disables filtering")
+    ap.add_argument("--reject-chain-utility-bonus", type=float, default=0.0, help="oversample rejected rows by draft tokens wasted at the rejection depth")
+    ap.add_argument("--reject-chain-utility-power", type=float, default=0.0, help="power-law oversampling by draft tokens wasted at the rejection depth")
     ap.add_argument("--candidate-rank-flip-weight", type=float, default=0.0)
     ap.add_argument("--candidate-rank-margin", type=float, default=0.15)
     ap.add_argument("--candidate-rank-max", type=int, default=8, help="only rank-flip rejects whose verifier token is within this dumped sampler-candidate rank; <=0 disables filtering")
@@ -688,7 +722,7 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     rng = np.random.default_rng(args.seed)
 
-    static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, pos_weights = build_indices(
+    static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, pos_weights, corr_weights, candidate_weights = build_indices(
         static_records,
         accept_records,
         label,
@@ -696,6 +730,10 @@ def main():
         token_to_local,
         args.accepted_chain_bonus,
         args.accepted_chain_power,
+        args.accepted_chain_utility_bonus,
+        args.accepted_chain_utility_power,
+        args.reject_chain_utility_bonus,
+        args.reject_chain_utility_power,
         args.candidate_rank_max,
     )
     if args.static_weight > 0 and len(static_idx) == 0:
@@ -717,14 +755,16 @@ def main():
     if args.target_overlap_weight > 0 and len(target_frontier_idx) == 0:
         raise ValueError("target overlap requested but no verified rows have MTPACC6 verifier candidates")
 
-    pos_weight_summary = None
-    if pos_weights is not None:
-        pos_weight_summary = {
-            "min": float(pos_weights.min()),
-            "mean": float(pos_weights.mean()),
-            "max": float(pos_weights.max()),
+    def weight_summary(weights):
+        if weights is None:
+            return None
+        return {
+            "min": float(weights.min()),
+            "mean": float(weights.mean()),
+            "max": float(weights.max()),
         }
-    print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx)), "recursive_corr": int(len(corr_idx)), "candidate_corr": int(len(candidate_idx)), "frontier_preserve": int(len(preserve_idx)), "target_frontier": int(len(target_frontier_idx)), "pos_weight_summary": pos_weight_summary}), flush=True)
+
+    print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx)), "recursive_corr": int(len(corr_idx)), "candidate_corr": int(len(candidate_idx)), "frontier_preserve": int(len(preserve_idx)), "target_frontier": int(len(target_frontier_idx)), "pos_weight_summary": weight_summary(pos_weights), "corr_weight_summary": weight_summary(corr_weights), "candidate_weight_summary": weight_summary(candidate_weights)}), flush=True)
     print(json.dumps({"event": "eval_start", **eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, label, token_to_local, args, device)}), flush=True)
 
     t0 = time.perf_counter()
@@ -771,13 +811,13 @@ def main():
             kl_terms.append(base_kl); dn_terms.append(delta_norm)
             metrics.update(ngate=gate.item(), nabove=above.item(), np=mean_p.item())
         if args.reject_correct_weight > 0:
-            h, y = sample_accept_targets(accept_records, corr_targets, corr_idx, args.batch_size, device, rng)
+            h, y = sample_accept_targets(accept_records, corr_targets, corr_idx, args.batch_size, device, rng, corr_weights)
             ce, base_kl, delta_norm, top1, correct_p, cont = ce_loss(model, output_weight, h, y, args.p_min)
             loss = loss + args.reject_correct_weight * ce
             kl_terms.append(base_kl); dn_terms.append(delta_norm)
             metrics.update(cce=ce.item(), ctop1=top1.item(), ccp=correct_p.item(), ccont=cont.item())
         if args.reject_rank_flip_weight > 0:
-            h, correct, draft = sample_accept_target_pairs(accept_records, corr_targets, token_to_local, corr_idx, args.batch_size, device, rng)
+            h, correct, draft = sample_accept_target_pairs(accept_records, corr_targets, token_to_local, corr_idx, args.batch_size, device, rng, corr_weights)
             vals = rank_flip_loss(model, output_weight, h, correct, draft, args.p_min, args.reject_rank_margin, args.reject_rank_max)
             flip_loss, base_kl, delta_norm, flip, base_flip, selected_flip, selected, selected_rank, correct_p, draft_p, correct_continue = vals
             loss = loss + args.reject_rank_flip_weight * flip_loss
@@ -794,7 +834,7 @@ def main():
                 fc=correct_continue.item(),
             )
         if args.candidate_rank_flip_weight > 0:
-            h, correct, draft = sample_accept_target_pairs(accept_records, corr_targets, token_to_local, candidate_idx, args.batch_size, device, rng)
+            h, correct, draft = sample_accept_target_pairs(accept_records, corr_targets, token_to_local, candidate_idx, args.batch_size, device, rng, candidate_weights)
             vals = pairwise_rank_flip_loss(model, output_weight, h, correct, draft, args.candidate_rank_margin)
             flip_loss, delta_norm, flip, base_flip, margin_mean, base_margin_mean = vals
             loss = loss + args.candidate_rank_flip_weight * flip_loss
