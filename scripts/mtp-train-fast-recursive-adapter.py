@@ -374,6 +374,30 @@ def target_overlap_loss(model, output_weight, h, target_candidates, target_ps, n
     return loss, base_kl, delta_norm, overlap.mean(), base_overlap.mean(), q_mass.mean(), p_mass.mean()
 
 
+def target_frontier_ce_loss(model, output_weight, h, target_candidates, target_ps):
+    logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
+    logits_f = logits.float()
+    mask = target_candidates >= 0
+    safe_candidates = target_candidates.clamp_min(0)
+    p = target_ps.float() * mask.float()
+    p_mass = p.sum(dim=1).clamp_min(1e-6)
+    p_norm = p / p_mass[:, None]
+    logp = F.log_softmax(logits_f, dim=-1)
+    target_logp = logp.gather(1, safe_candidates) * mask.float()
+    loss = -(p_norm * target_logp).sum(dim=1).mean()
+    base_logp = F.log_softmax(base_logits.float(), dim=-1)
+    base_target_logp = base_logp.gather(1, safe_candidates) * mask.float()
+    base_loss = -(p_norm * base_target_logp).sum(dim=1).mean()
+    base_kl = F.kl_div(logp, base_logp.exp(), reduction="batchmean")
+    delta_norm = delta.float().pow(2).mean()
+    with torch.no_grad():
+        probs = F.softmax(logits_f, dim=-1)
+        q = probs.gather(1, safe_candidates) * mask.float()
+        base_probs = F.softmax(base_logits.float(), dim=-1)
+        base_q = base_probs.gather(1, safe_candidates) * mask.float()
+    return loss, base_loss, base_kl, delta_norm, q.sum(dim=1).mean(), base_q.sum(dim=1).mean(), p_mass.mean()
+
+
 def recursive_chain_loss(model, output_weight, h, y, p_min):
     logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
     logits_f = logits.float()
@@ -717,12 +741,17 @@ def eval_split(model, output_weight, static_records, accept_records, static_idx,
         if len(target_frontier_idx):
             h, candidates, ps = sample_target_frontier(accept_records, target_frontier_candidates, target_frontier_ps, target_frontier_idx, args.batch_size, device, rng, target_frontier_weights)
             vals = target_overlap_loss(model, output_weight, h, candidates, ps, args.target_overlap_mode == "renorm")
+            ce_vals = target_frontier_ce_loss(model, output_weight, h, candidates, ps)
             out.update(
                 target_overlap_loss=float(vals[0].item()),
                 target_overlap=float(vals[3].item()),
                 target_base_overlap=float(vals[4].item()),
                 target_q_mass=float(vals[5].item()),
                 target_p_mass=float(vals[6].item()),
+                target_frontier_ce=float(ce_vals[0].item()),
+                target_frontier_base_ce=float(ce_vals[1].item()),
+                target_frontier_q_mass=float(ce_vals[4].item()),
+                target_frontier_base_q_mass=float(ce_vals[5].item()),
             )
     model.train()
     return out
@@ -769,6 +798,7 @@ def main():
     ap.add_argument("--accepted-frontier-margin", type=float, default=0.10)
     ap.add_argument("--target-overlap-weight", type=float, default=0.0, help="maximize draft probability overlap with verifier top-k candidates from MTPACC6 dumps")
     ap.add_argument("--target-overlap-mode", choices=["renorm", "lk"], default="renorm", help="renorm matches historical top-k proxy; lk preserves missing target mass as acceptance loss")
+    ap.add_argument("--target-frontier-ce-weight", type=float, default=0.0, help="soft CE toward verifier top-k candidates from MTPACC6 dumps")
     ap.add_argument("--target-overlap-chain-utility-bonus", type=float, default=0.0, help="oversample verifier-overlap rows by accepted-chain utility")
     ap.add_argument("--target-overlap-chain-utility-power", type=float, default=0.0, help="power-law verifier-overlap oversampling by accepted-chain utility")
     ap.add_argument("--base-kl-weight", type=float, default=0.02)
@@ -861,6 +891,8 @@ def main():
         raise ValueError("accepted frontier preservation requested but no accepted rows have a valid competitor candidate")
     if args.target_overlap_weight > 0 and len(target_frontier_idx) == 0:
         raise ValueError("target overlap requested but no verified rows have MTPACC6 verifier candidates")
+    if args.target_frontier_ce_weight > 0 and len(target_frontier_idx) == 0:
+        raise ValueError("target frontier CE requested but no verified rows have MTPACC6 verifier candidates")
 
     def weight_summary(weights):
         if weights is None:
@@ -993,6 +1025,19 @@ def main():
                 tbo=base_overlap.item(),
                 tq=q_mass.item(),
                 tp=p_mass.item(),
+            )
+        if args.target_frontier_ce_weight > 0:
+            h, candidates, ps = sample_target_frontier(accept_records, target_frontier_candidates, target_frontier_ps, target_frontier_idx, args.batch_size, device, rng, target_frontier_weights)
+            vals = target_frontier_ce_loss(model, output_weight, h, candidates, ps)
+            frontier_ce, base_frontier_ce, base_kl, delta_norm, q_mass, base_q_mass, p_mass = vals
+            loss = loss + args.target_frontier_ce_weight * frontier_ce
+            kl_terms.append(base_kl); dn_terms.append(delta_norm)
+            metrics.update(
+                tfce=frontier_ce.item(),
+                tfbce=base_frontier_ce.item(),
+                tfq=q_mass.item(),
+                tfbq=base_q_mass.item(),
+                tfp=p_mass.item(),
             )
         if kl_terms:
             loss = loss + args.base_kl_weight * torch.stack(kl_terms).mean()
