@@ -39,18 +39,23 @@ def read_perf(path):
 def open_accept_dump(path):
     with open(path, "rb") as f:
         magic, version, n_embd, meta, fmt, limit = HEADER.unpack(f.read(HEADER.size))
-    if magic != b"MTPACC2\0" or version != 2 or meta != 52 or fmt != 1:
+    if not ((magic == b"MTPACC2\0" and version == 2 and meta == 52) or (magic == b"MTPACC3\0" and version == 3 and meta == 56)) or fmt != 1:
         raise ValueError(f"unsupported accept dump {path}: magic={magic!r} version={version} meta={meta} fmt={fmt}")
-    dtype = np.dtype([
+    fields = [
         ("batch_id", "<u8"), ("seq_id", "<i4"), ("pos", "<i4"), ("depth", "<i4"),
         ("prev_token", "<i4"), ("draft_token", "<i4"), ("p", "<f4"),
         ("accepted", "<i4"), ("verified", "<i4"), ("n_accepted", "<i4"), ("n_drafted", "<i4"),
-        ("scale", "<f4"), ("q", "i1", (n_embd,)),
-    ])
+    ]
+    if version >= 3:
+        fields.append(("target_token", "<i4"))
+    fields.extend([("scale", "<f4"), ("q", "i1", (n_embd,))])
+    dtype = np.dtype(fields)
     record_size = meta + n_embd
     records = (os.path.getsize(path) - HEADER.size) // record_size
     return np.memmap(path, mode="r", dtype=dtype, offset=HEADER.size, shape=(records,)), {
         "limit": int(limit),
+        "version": int(version),
+        "has_target_token": bool(version >= 3),
         "n_embd": int(n_embd),
         "record_size": int(record_size),
         "records": int(records),
@@ -113,8 +118,8 @@ def analyze_dump(path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Analyze llama.cpp MTPACC2 accept/reject dumps.")
-    ap.add_argument("dump", nargs="+", help="MTPACC2 dump path(s)")
+    ap = argparse.ArgumentParser(description="Analyze llama.cpp MTPACC2/MTPACC3 accept/reject dumps.")
+    ap.add_argument("dump", nargs="+", help="MTPACC2/MTPACC3 dump path(s)")
     ap.add_argument("--perf", action="append", default=[], help="optional perf JSONL to summarize; can be repeated")
     args = ap.parse_args()
     for path in args.dump:

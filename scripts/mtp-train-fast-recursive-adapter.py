@@ -40,19 +40,22 @@ def read_accept_header(path):
     with open(path, "rb") as f:
         header = f.read(32)
     magic, version, n_embd, meta, fmt, limit = struct.unpack("<8sIIIIQ", header)
-    if magic != b"MTPACC2\0" or version != 2 or fmt != 1 or meta != 52:
+    if not ((magic == b"MTPACC2\0" and version == 2 and meta == 52) or (magic == b"MTPACC3\0" and version == 3 and meta == 56)) or fmt != 1:
         raise ValueError(f"unsupported accept dump: magic={magic!r} version={version} fmt={fmt} meta={meta}")
     records = (os.path.getsize(path) - 32) // (meta + n_embd)
-    return {"n_embd": n_embd, "records": records}
+    return {"n_embd": n_embd, "records": records, "version": version, "meta": meta}
 
 
 def open_accept(path, header):
-    dtype = np.dtype([
+    fields = [
         ("batch_id", "<u8"), ("seq_id", "<i4"), ("pos", "<i4"), ("depth", "<i4"),
         ("prev_token", "<i4"), ("draft_token", "<i4"), ("p", "<f4"),
         ("accepted", "<i4"), ("verified", "<i4"), ("n_accepted", "<i4"), ("n_drafted", "<i4"),
-        ("scale", "<f4"), ("q", "i1", (header["n_embd"],)),
-    ])
+    ]
+    if header["version"] >= 3:
+        fields.append(("target_token", "<i4"))
+    fields.extend([("scale", "<f4"), ("q", "i1", (header["n_embd"],))])
+    dtype = np.dtype(fields)
     return np.memmap(path, mode="r", dtype=dtype, offset=32, shape=(header["records"],))
 
 
@@ -285,6 +288,13 @@ def build_reject_correct_targets(accept_records, token_to_local):
         return np.array([], dtype=np.int64)
 
     target_local = np.full(len(accept_records), -1, dtype=np.int64)
+    if "target_token" in accept_records.dtype.names:
+        target = np.asarray(accept_records["target_token"], dtype=np.int64)
+        valid = (target >= 0) & (target < len(token_to_local))
+        target_local[valid] = token_to_local[target[valid]]
+        target_local[target_local < 0] = -1
+        return target_local
+
     depth0_by_next_pos = {}
     for i, row in enumerate(accept_records):
         if int(row["depth"]) != 0:
