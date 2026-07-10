@@ -176,6 +176,16 @@ def sample_accept_targets(records, target_local, idx, batch_size, device, rng):
     return h, y
 
 
+def sample_accept_target_pairs(records, target_local, token_to_local, idx, batch_size, device, rng):
+    chosen = rng.choice(idx, size=batch_size, replace=len(idx) < batch_size)
+    batch = records[chosen]
+    h = rows_to_h(batch, device)
+    correct = torch.from_numpy(target_local[chosen].astype(np.int64)).to(device=device)
+    draft_np = token_to_local[np.asarray(batch["draft_token"], dtype=np.int64)]
+    draft = torch.from_numpy(draft_np.astype(np.int64)).to(device=device)
+    return h, correct, draft
+
+
 def ce_loss(model, output_weight, h, y, p_min):
     logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
     logits_f = logits.float()
@@ -191,6 +201,41 @@ def ce_loss(model, output_weight, h, y, p_min):
     base_kl = F.kl_div(logp, base_logp.exp(), reduction="batchmean")
     delta_norm = delta.float().pow(2).mean()
     return ce, base_kl, delta_norm, top1, correct_p, continue_rate
+
+
+def rank_flip_loss(model, output_weight, h, correct, draft, p_min, margin, rank_max):
+    logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
+    logits_f = logits.float()
+    base_logits_f = base_logits.float()
+    correct_logit = logits_f.gather(1, correct[:, None]).squeeze(1)
+    draft_logit = logits_f.gather(1, draft[:, None]).squeeze(1)
+    base_correct_logit = base_logits_f.gather(1, correct[:, None]).squeeze(1)
+    base_draft_logit = base_logits_f.gather(1, draft[:, None]).squeeze(1)
+    if rank_max > 0:
+        rank = (base_logits_f > base_correct_logit[:, None]).sum(dim=1) + 1
+        mask = rank <= rank_max
+    else:
+        rank = torch.ones_like(correct, dtype=torch.int64)
+        mask = torch.ones_like(correct, dtype=torch.bool)
+    if mask.any():
+        loss = F.relu(margin - (correct_logit[mask] - draft_logit[mask])).mean()
+    else:
+        loss = logits_f.new_zeros(())
+    logp = F.log_softmax(logits_f, dim=-1)
+    base_logp = F.log_softmax(base_logits_f, dim=-1)
+    base_kl = F.kl_div(logp, base_logp.exp(), reduction="batchmean")
+    delta_norm = delta.float().pow(2).mean()
+    with torch.no_grad():
+        probs = F.softmax(logits_f, dim=-1)
+        correct_p = probs.gather(1, correct[:, None]).squeeze(1)
+        draft_p = probs.gather(1, draft[:, None]).squeeze(1)
+        flip = (correct_logit > draft_logit).float().mean()
+        base_flip = (base_correct_logit > base_draft_logit).float().mean()
+        selected = mask.float().mean()
+        selected_flip = (correct_logit[mask] > draft_logit[mask]).float().mean() if mask.any() else logits_f.new_zeros(())
+        selected_rank = rank[mask].float().mean() if mask.any() else logits_f.new_zeros(())
+        correct_continue = (correct_p >= p_min).float().mean()
+    return loss, base_kl, delta_norm, flip, base_flip, selected_flip, selected, selected_rank, correct_p.mean(), draft_p.mean(), correct_continue
 
 
 def neg_gate_loss(model, output_weight, h, y, p_min):
@@ -254,7 +299,8 @@ def build_indices(static_records, accept_records, label, runtime_depth, token_to
         verified = accept_records["verified"] == 1
         pos_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 1) & in_vocab)[0]
         neg_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 0) & in_vocab)[0]
-        corr_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 0) & (corr_targets >= 0))[0]
+        draft_local = token_to_local[toks]
+        corr_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 0) & (corr_targets >= 0) & (draft_local >= 0))[0]
     return static_idx, pos_idx, neg_idx, corr_idx, corr_targets
 
 
@@ -279,6 +325,19 @@ def eval_split(model, output_weight, static_records, accept_records, static_idx,
             h, y = sample_accept_targets(accept_records, corr_targets, corr_idx, args.batch_size, device, rng)
             ce, _, _, top1, correct_p, cont = ce_loss(model, output_weight, h, y, args.p_min)
             out.update(corr_ce=float(ce.item()), corr_top1=float(top1.item()), corr_correct_p=float(correct_p.item()), corr_continue=float(cont.item()))
+            h, correct, draft = sample_accept_target_pairs(accept_records, corr_targets, token_to_local, corr_idx, args.batch_size, device, rng)
+            vals = rank_flip_loss(model, output_weight, h, correct, draft, args.p_min, args.reject_rank_margin, args.reject_rank_max)
+            out.update(
+                corr_rank_flip_loss=float(vals[0].item()),
+                corr_rank_flip=float(vals[3].item()),
+                corr_base_rank_flip=float(vals[4].item()),
+                corr_selected_flip=float(vals[5].item()),
+                corr_selected=float(vals[6].item()),
+                corr_selected_rank=float(vals[7].item()),
+                corr_rank_correct_p=float(vals[8].item()),
+                corr_rank_draft_p=float(vals[9].item()),
+                corr_rank_continue=float(vals[10].item()),
+            )
     model.train()
     return out
 
@@ -301,6 +360,9 @@ def main():
     ap.add_argument("--recursive-weight", type=float, default=1.0)
     ap.add_argument("--negative-weight", type=float, default=0.35)
     ap.add_argument("--reject-correct-weight", type=float, default=0.0)
+    ap.add_argument("--reject-rank-flip-weight", type=float, default=0.0)
+    ap.add_argument("--reject-rank-margin", type=float, default=0.25)
+    ap.add_argument("--reject-rank-max", type=int, default=20, help="only rank-flip rejects whose verifier token is within this base local-vocab rank; <=0 disables filtering")
     ap.add_argument("--base-kl-weight", type=float, default=0.02)
     ap.add_argument("--delta-norm-weight", type=float, default=0.0002)
     ap.add_argument("--p-min", type=float, default=0.1)
@@ -355,6 +417,8 @@ def main():
         raise ValueError("negative gate requested but no verified rejected rows survive the FR vocab")
     if args.reject_correct_weight > 0 and len(corr_idx) == 0:
         raise ValueError("reject correction requested but no recoverable verified rejected rows survive the FR vocab")
+    if args.reject_rank_flip_weight > 0 and len(corr_idx) == 0:
+        raise ValueError("reject rank-flip requested but no recoverable verified rejected rows survive the FR vocab")
 
     print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx)), "recursive_corr": int(len(corr_idx))}), flush=True)
     print(json.dumps({"event": "eval_start", **eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, corr_targets, label, token_to_local, args, device)}), flush=True)
@@ -390,6 +454,23 @@ def main():
             loss = loss + args.reject_correct_weight * ce
             kl_terms.append(base_kl); dn_terms.append(delta_norm)
             metrics.update(cce=ce.item(), ctop1=top1.item(), ccp=correct_p.item(), ccont=cont.item())
+        if args.reject_rank_flip_weight > 0:
+            h, correct, draft = sample_accept_target_pairs(accept_records, corr_targets, token_to_local, corr_idx, args.batch_size, device, rng)
+            vals = rank_flip_loss(model, output_weight, h, correct, draft, args.p_min, args.reject_rank_margin, args.reject_rank_max)
+            flip_loss, base_kl, delta_norm, flip, base_flip, selected_flip, selected, selected_rank, correct_p, draft_p, correct_continue = vals
+            loss = loss + args.reject_rank_flip_weight * flip_loss
+            kl_terms.append(base_kl); dn_terms.append(delta_norm)
+            metrics.update(
+                rflip=flip_loss.item(),
+                f=flip.item(),
+                bf=base_flip.item(),
+                sf=selected_flip.item(),
+                sel=selected.item(),
+                sr=selected_rank.item(),
+                fcp=correct_p.item(),
+                fdp=draft_p.item(),
+                fc=correct_continue.item(),
+            )
         if kl_terms:
             loss = loss + args.base_kl_weight * torch.stack(kl_terms).mean()
             loss = loss + args.delta_norm_weight * torch.stack(dn_terms).mean()
