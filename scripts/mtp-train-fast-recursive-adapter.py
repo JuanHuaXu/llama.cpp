@@ -366,6 +366,25 @@ def teacher_kl_loss(model, teacher, output_weight, h):
     return loss, delta_norm, top_agree
 
 
+def accepted_draft_preserve_loss(model, teacher, output_weight, h, y, p_min, margin):
+    logits, _, delta = logits_for(model, output_weight, h, return_parts=True)
+    logits_f = logits.float()
+    logp = F.log_softmax(logits_f, dim=-1)
+    draft_logp = logp.gather(1, y[:, None]).squeeze(1)
+    with torch.no_grad():
+        teacher_logits = logits_for(teacher, output_weight, h).float()
+        teacher_logp = F.log_softmax(teacher_logits, dim=-1)
+        teacher_draft_logp = teacher_logp.gather(1, y[:, None]).squeeze(1)
+    loss = F.relu(teacher_draft_logp - draft_logp + margin).mean()
+    delta_norm = delta.float().pow(2).mean()
+    with torch.no_grad():
+        draft_p = draft_logp.exp()
+        teacher_p = teacher_draft_logp.exp()
+        preserved = (draft_logp >= teacher_draft_logp - margin).float().mean()
+        continue_rate = (draft_p >= p_min).float().mean()
+    return loss, delta_norm, preserved, draft_p.mean(), teacher_p.mean(), continue_rate
+
+
 def neg_gate_loss(model, output_weight, h, y, p_min):
     logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
     logp = F.log_softmax(logits.float(), dim=-1)
@@ -651,6 +670,8 @@ def main():
     ap.add_argument("--recursive-top-confidence-weight", type=float, default=0.0)
     ap.add_argument("--recursive-correct-margin-weight", type=float, default=0.0)
     ap.add_argument("--accepted-teacher-kl-weight", type=float, default=0.0, help="anchor accepted recursive rows to the initialized adapter distribution")
+    ap.add_argument("--accepted-draft-preserve-weight", type=float, default=0.0, help="penalize lowering accepted draft-token log-probability versus the initialized adapter")
+    ap.add_argument("--accepted-draft-preserve-margin", type=float, default=0.0, help="allowed accepted draft-token log-probability drop before preserve loss applies")
     ap.add_argument("--accepted-chain-bonus", type=float, default=0.0, help="legacy oversampling for accepted recursive rows beyond runtime_depth")
     ap.add_argument("--accepted-chain-power", type=float, default=0.0, help="power-law oversampling by n_accepted/runtime_depth for accepted recursive rows")
     ap.add_argument("--accepted-chain-utility-bonus", type=float, default=0.0, help="oversample accepted recursive rows by accepted tokens saved at this depth, including exact-depth successes")
@@ -712,7 +733,7 @@ def main():
     else:
         print(json.dumps({"event": "zero_init_adapter"}), flush=True)
     teacher_model = None
-    if args.accepted_teacher_kl_weight > 0:
+    if args.accepted_teacher_kl_weight > 0 or args.accepted_draft_preserve_weight > 0:
         teacher_model = LowRankHead(n_embd, args.rank, norm_weight, args.input_normalized).to(device=device, dtype=torch.float32)
         teacher_model.load_state_dict(model.state_dict(), strict=True)
         teacher_model.eval()
@@ -742,6 +763,8 @@ def main():
         raise ValueError("recursive CE requested but no accepted recursive rows survive the FR vocab")
     if args.accepted_teacher_kl_weight > 0 and len(pos_idx) == 0:
         raise ValueError("accepted teacher KL requested but no accepted recursive rows survive the FR vocab")
+    if args.accepted_draft_preserve_weight > 0 and len(pos_idx) == 0:
+        raise ValueError("accepted draft preservation requested but no accepted recursive rows survive the FR vocab")
     if args.negative_weight > 0 and len(neg_idx) == 0:
         raise ValueError("negative gate requested but no verified rejected rows survive the FR vocab")
     if args.reject_correct_weight > 0 and len(corr_idx) == 0:
@@ -804,6 +827,21 @@ def main():
             loss = loss + args.accepted_teacher_kl_weight * teacher_kl
             dn_terms.append(delta_norm)
             metrics.update(tkl=teacher_kl.item(), tagree=top_agree.item())
+        if args.accepted_draft_preserve_weight > 0:
+            h, y = sample_accept(accept_records, pos_idx, token_to_local, args.batch_size, device, rng, pos_weights)
+            vals = accepted_draft_preserve_loss(
+                model,
+                teacher_model,
+                output_weight,
+                h,
+                y,
+                args.p_min,
+                args.accepted_draft_preserve_margin,
+            )
+            preserve_loss, delta_norm, preserved, draft_p, teacher_p, continue_rate = vals
+            loss = loss + args.accepted_draft_preserve_weight * preserve_loss
+            dn_terms.append(delta_norm)
+            metrics.update(adp=preserve_loss.item(), adpr=preserved.item(), adpp=draft_p.item(), adpt=teacher_p.item(), adpc=continue_rate.item())
         if args.negative_weight > 0:
             h, y = sample_accept(accept_records, neg_idx, token_to_local, args.batch_size, device, rng)
             gate, base_kl, delta_norm, above, mean_p = neg_gate_loss(model, output_weight, h, y, args.p_min)
