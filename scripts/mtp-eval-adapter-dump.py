@@ -189,7 +189,7 @@ def main():
         name, path = parse_adapter(value)
         model = train_mod.LowRankHead(header["n_embd"], args.rank, norm_weight, args.input_normalized).to(device=device, dtype=torch.float32)
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt["state_dict"], strict=False)
+        train_mod.load_adapter_into_model(model, ckpt["state_dict"])
         summary = eval_model(train_mod, model, output_weight, records, idx, token_to_local, args.batch_size, device, args.p_min, base_top)
         print(json.dumps({"event": "adapter_eval", "name": name, "path": path, **summary}), flush=True)
 

@@ -149,6 +149,49 @@ class LowRankHead(nn.Module):
         return z
 
 
+def load_adapter_into_model(model, state_dict):
+    model_state = model.state_dict()
+    down_key = "down.weight"
+    up_key = "up.weight"
+    if (
+        down_key not in state_dict or
+        up_key not in state_dict or
+        state_dict[down_key].shape == model_state[down_key].shape
+    ):
+        model.load_state_dict(state_dict, strict=False)
+        return {"mode": "direct"}
+
+    src_down = state_dict[down_key].float()
+    src_up = state_dict[up_key].float()
+    dst_down_shape = model_state[down_key].shape
+    dst_up_shape = model_state[up_key].shape
+    if src_down.shape[1] != dst_down_shape[1] or src_up.shape[0] != dst_up_shape[0]:
+        raise ValueError(
+            "adapter embedding width mismatch: "
+            f"down {tuple(src_down.shape)} -> {tuple(dst_down_shape)}, "
+            f"up {tuple(src_up.shape)} -> {tuple(dst_up_shape)}"
+        )
+
+    src_rank = int(src_down.shape[0])
+    dst_rank = int(dst_down_shape[0])
+    if src_rank > dst_rank:
+        raise ValueError(f"cannot load rank-{src_rank} adapter into rank-{dst_rank} model")
+
+    expanded = {k: v.detach().clone() for k, v in model_state.items()}
+    expanded[down_key].zero_()
+    expanded[up_key].zero_()
+    expanded[down_key][:src_rank, :] = src_down.to(dtype=expanded[down_key].dtype)
+    scale = math.sqrt(float(dst_rank) / float(src_rank))
+    expanded[up_key][:, :src_rank] = (src_up * scale).to(dtype=expanded[up_key].dtype)
+    for key, value in state_dict.items():
+        if key in (down_key, up_key):
+            continue
+        if key in expanded and expanded[key].shape == value.shape:
+            expanded[key] = value.to(dtype=expanded[key].dtype)
+    model.load_state_dict(expanded, strict=True)
+    return {"mode": "expanded", "src_rank": src_rank, "dst_rank": dst_rank, "up_scale": scale}
+
+
 def logits_for(model, output_weight, h, return_parts=False):
     if return_parts:
         z, z_base, delta = model(h, return_parts=True)
@@ -728,8 +771,8 @@ def main():
     model = LowRankHead(n_embd, args.rank, norm_weight, args.input_normalized).to(device=device, dtype=torch.float32)
     if args.init_adapter:
         init = torch.load(args.init_adapter, map_location="cpu", weights_only=False)
-        model.load_state_dict(init["state_dict"], strict=False)
-        print(json.dumps({"event": "load_init_adapter", "path": args.init_adapter}), flush=True)
+        load_info = load_adapter_into_model(model, init["state_dict"])
+        print(json.dumps({"event": "load_init_adapter", "path": args.init_adapter, **load_info}), flush=True)
     else:
         print(json.dumps({"event": "zero_init_adapter"}), flush=True)
     teacher_model = None
