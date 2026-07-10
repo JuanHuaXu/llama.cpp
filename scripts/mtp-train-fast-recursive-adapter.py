@@ -268,6 +268,20 @@ def recursive_chain_loss(model, output_weight, h, y, p_min):
     return ce, continue_loss, top_confidence_loss, correct_margin_loss, base_kl, delta_norm, top1, correct_p, continue_rate, correct_continue_rate
 
 
+def teacher_kl_loss(model, teacher, output_weight, h):
+    logits, _, delta = logits_for(model, output_weight, h, return_parts=True)
+    with torch.no_grad():
+        teacher_logits = logits_for(teacher, output_weight, h).float()
+        teacher_logp = F.log_softmax(teacher_logits, dim=-1)
+        teacher_top = torch.argmax(teacher_logits, dim=-1)
+    logp = F.log_softmax(logits.float(), dim=-1)
+    loss = F.kl_div(logp, teacher_logp.exp(), reduction="batchmean")
+    delta_norm = delta.float().pow(2).mean()
+    with torch.no_grad():
+        top_agree = (torch.argmax(logits.float(), dim=-1) == teacher_top).float().mean()
+    return loss, delta_norm, top_agree
+
+
 def neg_gate_loss(model, output_weight, h, y, p_min):
     logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
     logp = F.log_softmax(logits.float(), dim=-1)
@@ -415,6 +429,7 @@ def main():
     ap.add_argument("--recursive-continue-weight", type=float, default=0.0)
     ap.add_argument("--recursive-top-confidence-weight", type=float, default=0.0)
     ap.add_argument("--recursive-correct-margin-weight", type=float, default=0.0)
+    ap.add_argument("--accepted-teacher-kl-weight", type=float, default=0.0, help="anchor accepted recursive rows to the initialized adapter distribution")
     ap.add_argument("--accepted-chain-bonus", type=float, default=0.0, help="oversample accepted recursive rows that came from longer accepted chains")
     ap.add_argument("--accepted-chain-power", type=float, default=0.0, help="power-law oversampling by n_accepted/runtime_depth for accepted recursive rows")
     ap.add_argument("--negative-weight", type=float, default=0.35)
@@ -464,6 +479,14 @@ def main():
         print(json.dumps({"event": "load_init_adapter", "path": args.init_adapter}), flush=True)
     else:
         print(json.dumps({"event": "zero_init_adapter"}), flush=True)
+    teacher_model = None
+    if args.accepted_teacher_kl_weight > 0:
+        teacher_model = LowRankHead(n_embd, args.rank, norm_weight, args.input_normalized).to(device=device, dtype=torch.float32)
+        teacher_model.load_state_dict(model.state_dict(), strict=True)
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad_(False)
+        print(json.dumps({"event": "teacher_anchor_init", "source": args.init_adapter or "zero_init_adapter"}), flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     rng = np.random.default_rng(args.seed)
 
@@ -480,6 +503,8 @@ def main():
         raise ValueError("static CE requested but no static rows survive the FR vocab")
     if args.recursive_weight > 0 and len(pos_idx) == 0:
         raise ValueError("recursive CE requested but no accepted recursive rows survive the FR vocab")
+    if args.accepted_teacher_kl_weight > 0 and len(pos_idx) == 0:
+        raise ValueError("accepted teacher KL requested but no accepted recursive rows survive the FR vocab")
     if args.negative_weight > 0 and len(neg_idx) == 0:
         raise ValueError("negative gate requested but no verified rejected rows survive the FR vocab")
     if args.reject_correct_weight > 0 and len(corr_idx) == 0:
@@ -528,6 +553,12 @@ def main():
                 rtconf=top_conf_loss.item(),
                 rcm=corr_margin_loss.item(),
             )
+        if args.accepted_teacher_kl_weight > 0:
+            h, _ = sample_accept(accept_records, pos_idx, token_to_local, args.batch_size, device, rng, pos_weights)
+            teacher_kl, delta_norm, top_agree = teacher_kl_loss(model, teacher_model, output_weight, h)
+            loss = loss + args.accepted_teacher_kl_weight * teacher_kl
+            dn_terms.append(delta_norm)
+            metrics.update(tkl=teacher_kl.item(), tagree=top_agree.item())
         if args.negative_weight > 0:
             h, y = sample_accept(accept_records, neg_idx, token_to_local, args.batch_size, device, rng)
             gate, base_kl, delta_norm, above, mean_p = neg_gate_loss(model, output_weight, h, y, args.p_min)
