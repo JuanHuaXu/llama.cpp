@@ -17,17 +17,39 @@ def read_perf(path):
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             obj = json.loads(line)
-            if obj.get("event") == "sample":
+            if obj.get("event") in {"sample", "request_done"}:
                 rows.append(obj)
     full = [row for row in rows if int(row.get("tokens_predicted", 0)) >= 700]
-    vals = [float(row["tok_s"]) for row in full]
-    all_vals = [float(row["tok_s"]) for row in rows]
+    vals = []
+    all_vals = []
+    prev_seconds = 0.0
+    for row in rows:
+        tok = int(row.get("tokens_predicted", 0) or 0)
+        tok_s = row.get("tok_s")
+        if tok_s is None and row.get("predicted_ms"):
+            ms = float(row["predicted_ms"])
+            tok_s = tok / (ms / 1000.0) if ms > 0 else None
+        if tok_s is None and row.get("seconds"):
+            seconds = float(row["seconds"])
+            dt = seconds - prev_seconds
+            prev_seconds = seconds
+            tok_s = tok / dt if dt > 0 else None
+        if tok_s is None:
+            continue
+        all_vals.append(float(tok_s))
+        if tok >= 700:
+            vals.append(float(tok_s))
+    draft_n = sum(int(row.get("draft_n") or 0) for row in rows)
+    draft_n_accepted = sum(int(row.get("draft_n_accepted") or 0) for row in rows)
     return {
         "path": path,
         "samples": len(rows),
         "full_samples": len(full),
         "tokens_all": sum(int(row.get("tokens_predicted", 0)) for row in rows),
         "tokens_full": sum(int(row.get("tokens_predicted", 0)) for row in full),
+        "draft_n": draft_n,
+        "draft_n_accepted": draft_n_accepted,
+        "accept_rate": draft_n_accepted / draft_n if draft_n else None,
         "median_all": statistics.median(all_vals) if all_vals else None,
         "median_full": statistics.median(vals) if vals else None,
         "mean_full": sum(vals) / len(vals) if vals else None,

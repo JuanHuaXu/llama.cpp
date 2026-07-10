@@ -3,6 +3,8 @@ import argparse
 import json
 import os
 import random
+import statistics
+import struct
 import time
 import urllib.error
 import urllib.request
@@ -31,15 +33,48 @@ PROMPTS = [
 ]
 
 
-def dump_records(path, n_embd=2048):
+ACCEPT_HEADER = struct.Struct("<8sIIIIQ")
+
+
+def dump_records(path):
     if not path or not os.path.exists(path):
         return 0
     size = os.path.getsize(path)
-    header = 32
-    rec = 52 + n_embd
-    if size < header:
+    if size < ACCEPT_HEADER.size:
         return 0
-    return (size - header) // rec
+    with open(path, "rb") as f:
+        magic, version, n_embd, meta, fmt, _limit = ACCEPT_HEADER.unpack(f.read(ACCEPT_HEADER.size))
+    if fmt != 1 or magic not in {b"MTPACC2\0", b"MTPACC3\0", b"MTPACC4\0", b"MTPACC5\0"}:
+        return 0
+    expected_meta = {2: 52, 3: 56, 4: 60, 5: 124}.get(version)
+    if expected_meta != meta:
+        return 0
+    return (size - ACCEPT_HEADER.size) // (meta + n_embd)
+
+
+def summarize_events(events):
+    done = [e for e in events if e.get("event") == "request_done"]
+    speeds = []
+    accepted = 0
+    drafted = 0
+    tokens = 0
+    for event in done:
+        tok = int(event.get("tokens_predicted") or 0)
+        tokens += tok
+        predicted_ms = float(event.get("predicted_ms") or 0.0)
+        if tok >= 700 and predicted_ms > 0:
+            speeds.append(tok / (predicted_ms / 1000.0))
+        accepted += int(event.get("draft_n_accepted") or 0)
+        drafted += int(event.get("draft_n") or 0)
+    return {
+        "requests": len(done),
+        "tokens_predicted": tokens,
+        "median_tok_s": statistics.median(speeds) if speeds else None,
+        "mean_tok_s": statistics.mean(speeds) if speeds else None,
+        "draft_n": drafted,
+        "draft_n_accepted": accepted,
+        "accept_rate": accepted / drafted if drafted else None,
+    }
 
 
 def post_completion(url, prompt, n_predict, temperature, seed, timeout):
@@ -87,12 +122,19 @@ def main():
         try:
             body = post_completion(url, prompt, args.n_predict, args.temperature, rng.randrange(1, 2**31), timeout=600)
             after = dump_records(args.dump)
+            timings = body.get("timings") or {}
             event = {
                 "event": "request_done",
                 "i": i,
                 "tokens_predicted": body.get("tokens_predicted"),
                 "tokens_evaluated": body.get("tokens_evaluated"),
                 "stop": body.get("stop"),
+                "predicted_ms": timings.get("predicted_ms"),
+                "predicted_per_second": timings.get("predicted_per_second"),
+                "prompt_ms": timings.get("prompt_ms"),
+                "prompt_per_second": timings.get("prompt_per_second"),
+                "draft_n": timings.get("draft_n"),
+                "draft_n_accepted": timings.get("draft_n_accepted"),
                 "records_before": before,
                 "records_after": after,
                 "records_delta": after - before,
@@ -116,6 +158,7 @@ def main():
         "records_added": final_records - started,
         "requests": len([e for e in events if e.get("event") == "request_done"]),
         "seconds": round(time.time() - t0, 3),
+        **summarize_events(events),
     }
     print(json.dumps(summary), flush=True)
     if args.log:
