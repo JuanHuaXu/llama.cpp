@@ -238,6 +238,30 @@ def rank_flip_loss(model, output_weight, h, correct, draft, p_min, margin, rank_
     return loss, base_kl, delta_norm, flip, base_flip, selected_flip, selected, selected_rank, correct_p.mean(), draft_p.mean(), correct_continue
 
 
+def recursive_chain_loss(model, output_weight, h, y, p_min):
+    logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
+    logits_f = logits.float()
+    logp = F.log_softmax(logits_f, dim=-1)
+    top_logp = logp.max(dim=-1).values
+    correct_logp = logp.gather(1, y[:, None]).squeeze(1)
+    log_p_min = math.log(p_min)
+    ce = F.cross_entropy(logits_f, y)
+    continue_loss = F.relu(log_p_min - top_logp).mean()
+    top_confidence_loss = -top_logp.mean()
+    correct_margin_loss = F.relu(log_p_min - correct_logp).mean()
+    base_logp = F.log_softmax(base_logits.float(), dim=-1)
+    base_kl = F.kl_div(logp, base_logp.exp(), reduction="batchmean")
+    delta_norm = delta.float().pow(2).mean()
+    with torch.no_grad():
+        probs = F.softmax(logits_f, dim=-1)
+        top = torch.argmax(probs, dim=-1)
+        top1 = (top == y).float().mean()
+        correct_p = probs.gather(1, y[:, None]).squeeze(1).mean()
+        continue_rate = (probs.max(dim=-1).values >= p_min).float().mean()
+        correct_continue_rate = (correct_logp.exp() >= p_min).float().mean()
+    return ce, continue_loss, top_confidence_loss, correct_margin_loss, base_kl, delta_norm, top1, correct_p, continue_rate, correct_continue_rate
+
+
 def neg_gate_loss(model, output_weight, h, y, p_min):
     logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
     logp = F.log_softmax(logits.float(), dim=-1)
@@ -358,6 +382,9 @@ def main():
     ap.add_argument("--lr", type=float, default=5e-6)
     ap.add_argument("--static-weight", type=float, default=0.35)
     ap.add_argument("--recursive-weight", type=float, default=1.0)
+    ap.add_argument("--recursive-continue-weight", type=float, default=0.0)
+    ap.add_argument("--recursive-top-confidence-weight", type=float, default=0.0)
+    ap.add_argument("--recursive-correct-margin-weight", type=float, default=0.0)
     ap.add_argument("--negative-weight", type=float, default=0.35)
     ap.add_argument("--reject-correct-weight", type=float, default=0.0)
     ap.add_argument("--reject-rank-flip-weight", type=float, default=0.0)
@@ -436,12 +463,24 @@ def main():
             loss = loss + args.static_weight * ce
             kl_terms.append(base_kl); dn_terms.append(delta_norm)
             metrics.update(sce=ce.item(), stop1=top1.item(), scp=correct_p.item(), scont=cont.item())
-        if args.recursive_weight > 0:
+        if args.recursive_weight > 0 or args.recursive_continue_weight > 0 or args.recursive_top_confidence_weight > 0 or args.recursive_correct_margin_weight > 0:
             h, y = sample_accept(accept_records, pos_idx, token_to_local, args.batch_size, device, rng)
-            ce, base_kl, delta_norm, top1, correct_p, cont = ce_loss(model, output_weight, h, y, args.p_min)
+            ce, cont_loss, top_conf_loss, corr_margin_loss, base_kl, delta_norm, top1, correct_p, cont, ccont = recursive_chain_loss(model, output_weight, h, y, args.p_min)
             loss = loss + args.recursive_weight * ce
+            loss = loss + args.recursive_continue_weight * cont_loss
+            loss = loss + args.recursive_top_confidence_weight * top_conf_loss
+            loss = loss + args.recursive_correct_margin_weight * corr_margin_loss
             kl_terms.append(base_kl); dn_terms.append(delta_norm)
-            metrics.update(rce=ce.item(), rtop1=top1.item(), rcp=correct_p.item(), rcont=cont.item())
+            metrics.update(
+                rce=ce.item(),
+                rtop1=top1.item(),
+                rcp=correct_p.item(),
+                rcont=cont.item(),
+                rccont=ccont.item(),
+                rcl=cont_loss.item(),
+                rtconf=top_conf_loss.item(),
+                rcm= corr_margin_loss.item(),
+            )
         if args.negative_weight > 0:
             h, y = sample_accept(accept_records, neg_idx, token_to_local, args.batch_size, device, rng)
             gate, base_kl, delta_norm, above, mean_p = neg_gate_loss(model, output_weight, h, y, args.p_min)
