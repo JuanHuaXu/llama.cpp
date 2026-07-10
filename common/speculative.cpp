@@ -1253,7 +1253,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_token draft_token = 0;
         int32_t     depth       = 0;
         float       p           = 0.0f;
+        float       h_in_scale  = 1.0f;
         float       h_scale     = 1.0f;
+        std::vector<int8_t> h_in_q8;
         std::vector<int8_t> h_q8;
     };
 
@@ -1295,10 +1297,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::fstream mtp_dump;
     std::vector<int8_t> mtp_dump_q8;
     std::fstream mtp_accept_dump;
+    std::fstream mtp_state_dump;
     std::vector<std::vector<mtp_accept_attempt>> mtp_accept_pending;
     uint64_t mtp_accept_dump_records = 0;
+    uint64_t mtp_state_dump_records = 0;
     uint64_t mtp_accept_batch_id     = 0;
     bool     mtp_accept_dump_finished = false;
+    bool     mtp_state_dump_finished = false;
     std::vector<llama_adapter_lora_ptr> mtp_lora_storage;
     llama_adapter_lora * mtp_lora_depth[3] = { nullptr, nullptr, nullptr };
     int32_t  mtp_lora_active_depth = -2;
@@ -1313,6 +1318,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::unordered_map<uint64_t, mtp_engram_entry> mtp_engram_cache;
     std::vector<uint64_t> mtp_engram_current_key;
     std::vector<bool> mtp_engram_current_valid;
+    std::vector<std::vector<float>> mtp_draft_input_h;
     uint64_t mtp_draft_cache_clock = 0;
     uint64_t mtp_draft_cache_queries = 0;
     uint64_t mtp_draft_cache_hits = 0;
@@ -1413,6 +1419,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         active_start_us.assign(n_seq, 0);
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
         mtp_accept_pending.assign(n_seq, {});
+        mtp_draft_input_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
         mtp_draft_cache_active.assign(n_seq, {});
         mtp_engram_current_key.assign(n_seq, 0);
         mtp_engram_current_valid.assign(n_seq, false);
@@ -1441,6 +1448,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         init_mtp_train_dump();
         init_mtp_accept_dump();
+        init_mtp_state_dump();
         init_mtp_loras();
     }
 
@@ -1467,6 +1475,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         if (mtp_accept_dump.is_open()) {
             mtp_accept_dump.close();
+        }
+        if (mtp_state_dump.is_open()) {
+            mtp_state_dump.close();
         }
         mtp_lora_storage.clear();
         llama_batch_free(batch);
@@ -2098,12 +2109,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         mtp_accept_dump.write(reinterpret_cast<const char *>(&value), sizeof(value));
     }
 
+    template <typename T>
+    void mtp_state_dump_write_scalar(const T & value) {
+        mtp_state_dump.write(reinterpret_cast<const char *>(&value), sizeof(value));
+    }
+
     static constexpr uint32_t mtp_accept_dump_header_bytes = 32;
     static constexpr uint32_t mtp_accept_dump_meta_bytes = 52;
     static constexpr uint32_t mtp_accept_dump_format_q8_row_scale = 1;
+    static constexpr uint32_t mtp_state_dump_meta_bytes = 56;
+    static constexpr uint32_t mtp_state_dump_format_q8_pair_scale = 1;
 
     uint32_t mtp_accept_dump_record_bytes() const {
         return mtp_accept_dump_meta_bytes + (uint32_t) n_embd;
+    }
+
+    uint32_t mtp_state_dump_record_bytes() const {
+        return mtp_state_dump_meta_bytes + 2u * (uint32_t) n_embd;
     }
 
     bool init_mtp_accept_dump_append(const char expected_magic[8], uint32_t expected_version) {
@@ -2247,6 +2269,72 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    float quantize_hidden_row_q8(const float * h, std::vector<int8_t> & q8) const {
+        q8.resize((size_t) n_embd);
+
+        if (h == nullptr) {
+            std::fill(q8.begin(), q8.end(), 0);
+            return 1.0f;
+        }
+
+        float max_abs = 0.0f;
+        for (int32_t i = 0; i < n_embd; ++i) {
+            max_abs = std::max(max_abs, std::fabs(h[i]));
+        }
+        const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+        for (int32_t i = 0; i < n_embd; ++i) {
+            const float scaled = h[i] / scale;
+            const int q = std::max(-127, std::min(127, (int) std::lround(scaled)));
+            q8[(size_t) i] = (int8_t) q;
+        }
+        return scale;
+    }
+
+    void init_mtp_state_dump() {
+        if (params.mtp_state_dump.empty()) {
+            return;
+        }
+
+        const char magic[8] = { 'M', 'T', 'P', 'S', 'T', '3', '\0', '\0' };
+        const uint32_t version = 1;
+
+        mtp_state_dump.open(params.mtp_state_dump, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!mtp_state_dump.is_open()) {
+            SPC_WRN("failed to open MTP transition state dump '%s'\n", params.mtp_state_dump.c_str());
+            mtp_state_dump_finished = true;
+            return;
+        }
+
+        mtp_state_dump.write(magic, sizeof(magic));
+        mtp_state_dump_write_scalar(version);
+        mtp_state_dump_write_scalar((uint32_t) n_embd);
+        mtp_state_dump_write_scalar(mtp_state_dump_meta_bytes);
+        mtp_state_dump_write_scalar(mtp_state_dump_format_q8_pair_scale);
+        mtp_state_dump_write_scalar(params.mtp_state_dump_limit);
+
+        if (!mtp_state_dump.good()) {
+            SPC_WRN("failed to write MTP transition state dump header '%s'\n", params.mtp_state_dump.c_str());
+            mtp_state_dump.close();
+            mtp_state_dump_finished = true;
+            return;
+        }
+
+        SPC_INF("MTP transition state dump enabled: path='%s', n_embd=%d, record_size=%u, limit=%" PRIu64 "\n",
+                params.mtp_state_dump.c_str(), n_embd, mtp_state_dump_record_bytes(), params.mtp_state_dump_limit);
+    }
+
+    void finish_mtp_state_dump_if_needed() {
+        if (!mtp_state_dump.is_open() || mtp_state_dump_finished) {
+            return;
+        }
+        if (params.mtp_state_dump_limit > 0 && mtp_state_dump_records >= params.mtp_state_dump_limit) {
+            SPC_INF("MTP transition state dump reached limit: records=%" PRIu64 ", path='%s'\n",
+                    mtp_state_dump_records, params.mtp_state_dump.c_str());
+            mtp_state_dump.close();
+            mtp_state_dump_finished = true;
+        }
+    }
+
     void add_mtp_accept_attempt(
             llama_seq_id seq_id,
             llama_pos pos,
@@ -2254,8 +2342,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_token draft_token,
             int32_t depth,
             float p,
+            const float * h_in,
             const float * h) {
-        if (!mtp_accept_dump.is_open() || mtp_accept_dump_finished || h == nullptr ||
+        if (((!mtp_accept_dump.is_open() || mtp_accept_dump_finished) &&
+                    (!mtp_state_dump.is_open() || mtp_state_dump_finished)) || h == nullptr ||
                 seq_id < 0 || seq_id >= (llama_seq_id) mtp_accept_pending.size()) {
             return;
         }
@@ -2266,24 +2356,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         attempt.draft_token = draft_token;
         attempt.depth = depth;
         attempt.p = p;
-        attempt.h_q8.resize((size_t) n_embd);
-
-        float max_abs = 0.0f;
-        for (int32_t i = 0; i < n_embd; ++i) {
-            max_abs = std::max(max_abs, std::fabs(h[i]));
-        }
-        attempt.h_scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
-        for (int32_t i = 0; i < n_embd; ++i) {
-            const float scaled = h[i] / attempt.h_scale;
-            const int q = std::max(-127, std::min(127, (int) std::lround(scaled)));
-            attempt.h_q8[(size_t) i] = (int8_t) q;
-        }
+        attempt.h_in_scale = quantize_hidden_row_q8(h_in, attempt.h_in_q8);
+        attempt.h_scale = quantize_hidden_row_q8(h, attempt.h_q8);
 
         mtp_accept_pending[seq_id].push_back(std::move(attempt));
     }
 
     void dump_mtp_accept_records(llama_seq_id seq_id, uint16_t n_accepted) {
-        if (!mtp_accept_dump.is_open() || mtp_accept_dump_finished ||
+        if (((!mtp_accept_dump.is_open() || mtp_accept_dump_finished) &&
+                    (!mtp_state_dump.is_open() || mtp_state_dump_finished)) ||
                 seq_id < 0 || seq_id >= (llama_seq_id) mtp_accept_pending.size()) {
             return;
         }
@@ -2295,42 +2376,71 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         for (int32_t i = 0; i < n_drafted; ++i) {
             finish_mtp_accept_dump_if_needed();
-            if (!mtp_accept_dump.is_open()) {
-                break;
-            }
 
             const auto & a = attempts[i];
             const int32_t accepted = i < n_acc ? 1 : 0;
             const int32_t verified = i <= n_acc ? 1 : 0; // after the first rejection, later chain tokens were never target-verified.
             const float prob = std::isfinite(a.p) ? a.p : 0.0f;
 
-            mtp_accept_dump_write_scalar(batch_id);
-            mtp_accept_dump_write_scalar((int32_t) seq_id);
-            mtp_accept_dump_write_scalar((int32_t) a.pos);
-            mtp_accept_dump_write_scalar((int32_t) a.depth);
-            mtp_accept_dump_write_scalar((int32_t) a.prev_token);
-            mtp_accept_dump_write_scalar((int32_t) a.draft_token);
-            mtp_accept_dump_write_scalar(prob);
-            mtp_accept_dump_write_scalar(accepted);
-            mtp_accept_dump_write_scalar(verified);
-            mtp_accept_dump_write_scalar(n_acc);
-            mtp_accept_dump_write_scalar(n_drafted);
-            mtp_accept_dump_write_scalar(a.h_scale);
-            mtp_accept_dump.write(reinterpret_cast<const char *>(a.h_q8.data()), a.h_q8.size());
+            if (mtp_accept_dump.is_open() && !mtp_accept_dump_finished) {
+                mtp_accept_dump_write_scalar(batch_id);
+                mtp_accept_dump_write_scalar((int32_t) seq_id);
+                mtp_accept_dump_write_scalar((int32_t) a.pos);
+                mtp_accept_dump_write_scalar((int32_t) a.depth);
+                mtp_accept_dump_write_scalar((int32_t) a.prev_token);
+                mtp_accept_dump_write_scalar((int32_t) a.draft_token);
+                mtp_accept_dump_write_scalar(prob);
+                mtp_accept_dump_write_scalar(accepted);
+                mtp_accept_dump_write_scalar(verified);
+                mtp_accept_dump_write_scalar(n_acc);
+                mtp_accept_dump_write_scalar(n_drafted);
+                mtp_accept_dump_write_scalar(a.h_scale);
+                mtp_accept_dump.write(reinterpret_cast<const char *>(a.h_q8.data()), a.h_q8.size());
 
-            if (!mtp_accept_dump.good()) {
-                SPC_WRN("failed while writing MTP accept/reject dump '%s' after %" PRIu64 " records\n",
-                        params.mtp_accept_dump.c_str(), mtp_accept_dump_records);
-                mtp_accept_dump.close();
-                mtp_accept_dump_finished = true;
-                break;
+                if (!mtp_accept_dump.good()) {
+                    SPC_WRN("failed while writing MTP accept/reject dump '%s' after %" PRIu64 " records\n",
+                            params.mtp_accept_dump.c_str(), mtp_accept_dump_records);
+                    mtp_accept_dump.close();
+                    mtp_accept_dump_finished = true;
+                    break;
+                }
+
+                ++mtp_accept_dump_records;
             }
 
-            ++mtp_accept_dump_records;
+            finish_mtp_state_dump_if_needed();
+            if (mtp_state_dump.is_open() && !mtp_state_dump_finished) {
+                mtp_state_dump_write_scalar(batch_id);
+                mtp_state_dump_write_scalar((int32_t) seq_id);
+                mtp_state_dump_write_scalar((int32_t) a.pos);
+                mtp_state_dump_write_scalar((int32_t) a.depth);
+                mtp_state_dump_write_scalar((int32_t) a.prev_token);
+                mtp_state_dump_write_scalar((int32_t) a.draft_token);
+                mtp_state_dump_write_scalar(prob);
+                mtp_state_dump_write_scalar(accepted);
+                mtp_state_dump_write_scalar(verified);
+                mtp_state_dump_write_scalar(n_acc);
+                mtp_state_dump_write_scalar(n_drafted);
+                mtp_state_dump_write_scalar(a.h_in_scale);
+                mtp_state_dump_write_scalar(a.h_scale);
+                mtp_state_dump.write(reinterpret_cast<const char *>(a.h_in_q8.data()), a.h_in_q8.size());
+                mtp_state_dump.write(reinterpret_cast<const char *>(a.h_q8.data()), a.h_q8.size());
+
+                if (!mtp_state_dump.good()) {
+                    SPC_WRN("failed while writing MTP transition state dump '%s' after %" PRIu64 " records\n",
+                            params.mtp_state_dump.c_str(), mtp_state_dump_records);
+                    mtp_state_dump.close();
+                    mtp_state_dump_finished = true;
+                    break;
+                }
+
+                ++mtp_state_dump_records;
+            }
         }
 
         attempts.clear();
         finish_mtp_accept_dump_if_needed();
+        finish_mtp_state_dump_if_needed();
     }
 
     void write_mtp_train_record(
@@ -2708,6 +2818,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
+            if (seq_id >= 0 && seq_id < (llama_seq_id) mtp_draft_input_h.size()) {
+                mtp_draft_input_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+            }
         }
 
         int i = 0;
@@ -2775,7 +2888,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto & result = *dp.result;
                 const llama_token prev_token = result.empty() ? dp.id_last : result.back();
-                add_mtp_accept_attempt(seq_id, dp.n_past + (llama_pos) result.size() + 1, prev_token, id, i, p_draft, h_row);
+                const float * h_in = seq_id >= 0 && seq_id < (llama_seq_id) mtp_draft_input_h.size()
+                    ? mtp_draft_input_h[seq_id].data()
+                    : nullptr;
+                add_mtp_accept_attempt(seq_id, dp.n_past + (llama_pos) result.size() + 1, prev_token, id, i, p_draft, h_in, h_row);
 
                 common_sampler_accept(smpl, id, true);
 
@@ -2808,6 +2924,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 }
 
+                if (seq_id >= 0 && seq_id < (llama_seq_id) mtp_draft_input_h.size()) {
+                    mtp_draft_input_h[seq_id].assign(h_row, h_row + n_embd);
+                }
                 i_last[seq_id] = batch.n_tokens - 1;
             }
 

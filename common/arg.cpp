@@ -3788,6 +3788,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_ACCEPT_DUMP_APPEND"));
     add_opt(common_arg(
+        {"--spec-mtp-state-dump"}, "FNAME",
+        "path to write draft-MTP transition state records (input hidden + output hidden)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_state_dump = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STATE_DUMP"));
+    add_opt(common_arg(
+        {"--spec-mtp-state-dump-limit"}, "N",
+        "maximum number of draft-MTP transition state records to write (default: 0 = unlimited)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_state_dump_limit = std::stoull(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STATE_DUMP_LIMIT"));
+    add_opt(common_arg(
         {"--spec-mtp-draft-cache"},
         {"--no-spec-mtp-draft-cache"},
         string_format("cache and reuse verified draft-MTP token chains (default: %s)",

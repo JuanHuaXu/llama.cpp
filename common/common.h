@@ -339,6 +339,9 @@ struct common_params_speculative_draft {
     uint64_t mtp_accept_dump_limit = 0; // maximum accept/reject records to dump (0 = unlimited)
     bool mtp_accept_dump_append = false; // append to an existing compatible accept/reject dump
 
+    std::string mtp_state_dump; // path to write draft-MTP transition state records
+    uint64_t mtp_state_dump_limit = 0; // maximum transition state records to dump (0 = unlimited)
+
     bool mtp_draft_cache = false; // reuse verified draft-MTP chains for repeated token windows
     uint32_t mtp_draft_cache_size = 8192; // maximum cached draft windows
     uint32_t mtp_draft_cache_context = 32; // tokens from the accepted prefix used as the cache key
