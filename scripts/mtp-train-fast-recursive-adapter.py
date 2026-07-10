@@ -71,6 +71,17 @@ def open_accept(path, header):
     return np.memmap(path, mode="r", dtype=dtype, offset=32, shape=(header["records"],))
 
 
+def accept_prompt_groups(records, tokens_per_group):
+    if tokens_per_group <= 0:
+        return np.zeros(len(records), dtype=np.int64)
+    row_type = records["row_type"] == 0 if "row_type" in records.dtype.names else np.ones(len(records), dtype=bool)
+    draft = records[row_type]
+    batch_ids, first = np.unique(draft["batch_id"], return_index=True)
+    output_tokens = np.asarray(draft["n_accepted"][first], dtype=np.int64) + 1
+    batch_groups = (np.cumsum(output_tokens) - output_tokens) // tokens_per_group
+    return batch_groups[np.searchsorted(batch_ids, records["batch_id"])]
+
+
 def load_tensor(reader, name):
     for tensor in reader.tensors:
         if tensor.name == name:
@@ -94,13 +105,20 @@ def load_output_weight(reader, cache_path, device):
     return weight.to(device=device, dtype=dtype, non_blocking=True)
 
 
-def load_norm_weight(reader, n_embd, device):
+def load_mtp_head_norm_weight(reader, n_embd, device):
+    # qwen35moe applies the MTP shared-head norm before the hidden LoRA.
+    for tensor in reader.tensors:
+        if tensor.name.endswith(".nextn.shared_head_norm.weight"):
+            norm = dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
+            if norm.shape != (n_embd,):
+                raise ValueError(f"unexpected MTP shared-head norm shape: {norm.shape}")
+            return torch.from_numpy(norm).to(device=device, dtype=torch.float16), tensor.name
     try:
         tensor = load_tensor(reader, "output_norm.weight")
-        norm = torch.from_numpy(np.asarray(tensor.data, dtype=np.float32))
+        norm = dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
+        return torch.from_numpy(norm).to(device=device, dtype=torch.float16), tensor.name
     except KeyError:
-        norm = torch.ones(n_embd, dtype=torch.float32)
-    return norm.to(device=device, dtype=torch.float16)
+        return torch.ones(n_embd, device=device, dtype=torch.float16), "identity"
 
 
 def load_fr_vocab(path, vocab_size):
@@ -129,7 +147,9 @@ class LowRankHead(nn.Module):
         self.register_buffer("norm_weight", norm_weight.float().clone())
         self.down = nn.Linear(n_embd, rank, bias=False)
         self.up = nn.Linear(rank, n_embd, bias=False)
-        self.scale = rank ** -0.5
+        # The GGUF exporter pre-scales lora_b by rank^-0.5. llama.cpp then
+        # applies alpha/rank with alpha=sqrt(rank), for rank^-1 overall.
+        self.scale = rank ** -1.0
         nn.init.normal_(self.down.weight, std=0.01)
         nn.init.zeros_(self.up.weight)
 
@@ -153,16 +173,18 @@ def load_adapter_into_model(model, state_dict):
     model_state = model.state_dict()
     down_key = "down.weight"
     up_key = "up.weight"
+    adapter_state = {key: value for key, value in state_dict.items() if key != "norm_weight"}
     if (
-        down_key not in state_dict or
-        up_key not in state_dict or
-        state_dict[down_key].shape == model_state[down_key].shape
+        down_key not in adapter_state or
+        up_key not in adapter_state or
+        adapter_state[down_key].shape == model_state[down_key].shape
     ):
-        model.load_state_dict(state_dict, strict=False)
+        # The runtime adapter carries matrices only; its saved norm is not runtime state.
+        model.load_state_dict(adapter_state, strict=False)
         return {"mode": "direct"}
 
-    src_down = state_dict[down_key].float()
-    src_up = state_dict[up_key].float()
+    src_down = adapter_state[down_key].float()
+    src_up = adapter_state[up_key].float()
     dst_down_shape = model_state[down_key].shape
     dst_up_shape = model_state[up_key].shape
     if src_down.shape[1] != dst_down_shape[1] or src_up.shape[0] != dst_up_shape[0]:
@@ -181,9 +203,9 @@ def load_adapter_into_model(model, state_dict):
     expanded[down_key].zero_()
     expanded[up_key].zero_()
     expanded[down_key][:src_rank, :] = src_down.to(dtype=expanded[down_key].dtype)
-    scale = math.sqrt(float(dst_rank) / float(src_rank))
+    scale = float(dst_rank) / float(src_rank)
     expanded[up_key][:, :src_rank] = (src_up * scale).to(dtype=expanded[up_key].dtype)
-    for key, value in state_dict.items():
+    for key, value in adapter_state.items():
         if key in (down_key, up_key):
             continue
         if key in expanded and expanded[key].shape == value.shape:
@@ -396,6 +418,71 @@ def target_frontier_ce_loss(model, output_weight, h, target_candidates, target_p
         base_probs = F.softmax(base_logits.float(), dim=-1)
         base_q = base_probs.gather(1, safe_candidates) * mask.float()
     return loss, base_loss, base_kl, delta_norm, q.sum(dim=1).mean(), base_q.sum(dim=1).mean(), p_mass.mean()
+
+
+def verifier_decision_loss(model, output_weight, h, target_candidates, preserve_weight):
+    logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
+    logits_f = logits.float()
+    base_logits_f = base_logits.float()
+    mask = target_candidates >= 0
+    safe_candidates = target_candidates.clamp_min(0)
+    base_top = base_logits_f.argmax(dim=1)
+    base_ok = ((safe_candidates == base_top[:, None]) & mask).any(dim=1)
+
+    logp = F.log_softmax(logits_f, dim=-1)
+    candidate_logp = logp.gather(1, safe_candidates).masked_fill(~mask, -torch.inf)
+    rejected = ~base_ok
+    reject_loss = -torch.logsumexp(candidate_logp[rejected], dim=1).mean() if rejected.any() else logits_f.new_zeros(())
+
+    base_logp = F.log_softmax(base_logits_f, dim=-1)
+    preserve_loss = F.kl_div(
+        logp[base_ok], base_logp[base_ok].exp(), reduction="batchmean") if base_ok.any() else logits_f.new_zeros(())
+    loss = reject_loss + preserve_weight * preserve_loss
+    base_kl = F.kl_div(logp, base_logp.exp(), reduction="batchmean")
+    delta_norm = delta.float().pow(2).mean()
+
+    with torch.no_grad():
+        top = logits_f.argmax(dim=1)
+        accepted = ((safe_candidates == top[:, None]) & mask).any(dim=1)
+        preserve = accepted[base_ok].float().mean() if base_ok.any() else logits_f.new_ones(())
+        rescue = accepted[rejected].float().mean() if rejected.any() else logits_f.new_zeros(())
+    return loss, reject_loss, preserve_loss, base_kl, delta_norm, accepted.float().mean(), base_ok.float().mean(), preserve, rescue
+
+
+@torch.no_grad()
+def verifier_accept_metrics(model, output_weight, records, idx, target_candidates, batch_size, device):
+    total = 0
+    base_accepted = 0
+    accepted = 0
+    changed = 0
+    preserved = 0
+    rescued = 0
+    model.eval()
+    for start in range(0, len(idx), batch_size):
+        chosen = idx[start:start + batch_size]
+        h = rows_to_h(records[chosen], device)
+        candidates = torch.from_numpy(target_candidates[chosen].astype(np.int64)).to(device=device)
+        mask = candidates >= 0
+        safe_candidates = candidates.clamp_min(0)
+        logits, base_logits, _ = logits_for(model, output_weight, h, return_parts=True)
+        top = logits.float().argmax(dim=1)
+        base_top = base_logits.float().argmax(dim=1)
+        ok = ((safe_candidates == top[:, None]) & mask).any(dim=1)
+        base_ok = ((safe_candidates == base_top[:, None]) & mask).any(dim=1)
+        total += len(chosen)
+        accepted += int(ok.sum().item())
+        base_accepted += int(base_ok.sum().item())
+        changed += int((top != base_top).sum().item())
+        preserved += int((ok & base_ok).sum().item())
+        rescued += int((ok & ~base_ok).sum().item())
+    return {
+        "verifier_rows": total,
+        "verifier_accept": accepted / total if total else 0.0,
+        "verifier_base_accept": base_accepted / total if total else 0.0,
+        "verifier_changed": changed / total if total else 0.0,
+        "verifier_preserve": preserved / base_accepted if base_accepted else 1.0,
+        "verifier_rescue": rescued / (total - base_accepted) if total > base_accepted else 0.0,
+    }
 
 
 def recursive_chain_loss(model, output_weight, h, y, p_min):
@@ -799,6 +886,8 @@ def main():
     ap.add_argument("--target-overlap-weight", type=float, default=0.0, help="maximize draft probability overlap with verifier top-k candidates from MTPACC6 dumps")
     ap.add_argument("--target-overlap-mode", choices=["renorm", "lk"], default="renorm", help="renorm matches historical top-k proxy; lk preserves missing target mass as acceptance loss")
     ap.add_argument("--target-frontier-ce-weight", type=float, default=0.0, help="soft CE toward verifier top-k candidates from MTPACC6 dumps")
+    ap.add_argument("--verifier-decision-weight", type=float, default=0.0, help="preserve verifier-accepted top tokens and move rejected rows into the verifier top-k set")
+    ap.add_argument("--verifier-preserve-weight", type=float, default=1.0, help="KL preservation weight inside --verifier-decision-weight")
     ap.add_argument("--target-overlap-chain-utility-bonus", type=float, default=0.0, help="oversample verifier-overlap rows by accepted-chain utility")
     ap.add_argument("--target-overlap-chain-utility-power", type=float, default=0.0, help="power-law verifier-overlap oversampling by accepted-chain utility")
     ap.add_argument("--base-kl-weight", type=float, default=0.02)
@@ -807,6 +896,9 @@ def main():
     ap.add_argument("--input-normalized", action="store_true")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--tokens-per-group", type=int, default=0, help="generated tokens per prompt group in the accept dump")
+    ap.add_argument("--train-groups", type=int, default=0, help="train on prompt groups below N and validate on the remaining groups")
+    ap.add_argument("--eval-every", type=int, default=100, help="steps between full verifier validation passes")
     args = ap.parse_args()
 
     if not args.static_dump and not args.accept_dump:
@@ -831,11 +923,32 @@ def main():
             raise ValueError("static and accept dumps have different n_embd")
         n_embd = header["n_embd"]
 
+    validation_records = None
+    if accept_records is not None and args.train_groups > 0:
+        if args.tokens_per_group <= 0:
+            raise ValueError("--train-groups requires --tokens-per-group")
+        groups = accept_prompt_groups(accept_records, args.tokens_per_group)
+        train_mask = groups < args.train_groups
+        validation_mask = ~train_mask
+        if not train_mask.any() or not validation_mask.any():
+            raise ValueError("prompt-group split produced an empty train or validation set")
+        validation_records = accept_records[validation_mask]
+        accept_records = accept_records[train_mask]
+        print(json.dumps({
+            "event": "prompt_group_split",
+            "tokens_per_group": args.tokens_per_group,
+            "train_groups": args.train_groups,
+            "total_groups": int(groups.max()) + 1,
+            "train_rows": int(train_mask.sum()),
+            "validation_rows": int(validation_mask.sum()),
+        }), flush=True)
+
     reader = GGUFReader(args.gguf)
     full_output_weight = load_output_weight(reader, args.output_cache, device)
     fr_ids, token_to_local = load_fr_vocab(args.fr_vocab, full_output_weight.shape[0])
     output_weight = full_output_weight[torch.from_numpy(fr_ids).to(device=device)]
-    norm_weight = load_norm_weight(reader, n_embd, device)
+    norm_weight, norm_name = load_mtp_head_norm_weight(reader, n_embd, device)
+    print(json.dumps({"event": "load_mtp_head_norm", "tensor": norm_name}), flush=True)
     model = LowRankHead(n_embd, args.rank, norm_weight, args.input_normalized).to(device=device, dtype=torch.float32)
     if args.init_adapter:
         init = torch.load(args.init_adapter, map_location="cpu", weights_only=False)
@@ -893,6 +1006,22 @@ def main():
         raise ValueError("target overlap requested but no verified rows have MTPACC6 verifier candidates")
     if args.target_frontier_ce_weight > 0 and len(target_frontier_idx) == 0:
         raise ValueError("target frontier CE requested but no verified rows have MTPACC6 verifier candidates")
+    if args.verifier_decision_weight > 0 and len(target_frontier_idx) == 0:
+        raise ValueError("verifier decision loss requested but no verified rows have MTPACC6 verifier candidates")
+
+    validation = None
+    if validation_records is not None:
+        validation = build_indices(
+            None,
+            validation_records,
+            label,
+            args.runtime_depth,
+            token_to_local,
+            args.train_depth_mode,
+            candidate_rank_max=args.candidate_rank_max,
+        )
+        if len(validation[6]) == 0:
+            raise ValueError("validation split has no verifier frontier rows")
 
     def weight_summary(weights):
         if weights is None:
@@ -904,7 +1033,21 @@ def main():
         }
 
     print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx)), "recursive_corr": int(len(corr_idx)), "candidate_corr": int(len(candidate_idx)), "frontier_preserve": int(len(preserve_idx)), "target_frontier": int(len(target_frontier_idx)), "pos_weight_summary": weight_summary(pos_weights), "corr_weight_summary": weight_summary(corr_weights), "candidate_weight_summary": weight_summary(candidate_weights), "target_frontier_weight_summary": weight_summary(target_frontier_weights)}), flush=True)
-    print(json.dumps({"event": "eval_start", **eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, target_frontier_weights, label, token_to_local, args, device)}), flush=True)
+    if validation is not None:
+        val_target_idx = validation[6]
+        val_target_candidates = validation[9]
+        start_eval = verifier_accept_metrics(
+            model, output_weight, validation_records, val_target_idx,
+            val_target_candidates, args.batch_size, device)
+    else:
+        start_eval = verifier_accept_metrics(
+            model, output_weight, accept_records, target_frontier_idx,
+            target_frontier_candidates, args.batch_size, device)
+    print(json.dumps({"event": "eval_start", **start_eval}), flush=True)
+
+    best_metric = (start_eval["verifier_accept"], -start_eval["verifier_changed"])
+    best_step = 0
+    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     t0 = time.perf_counter()
     progress = tqdm(range(1, args.steps + 1), dynamic_ncols=True)
@@ -1039,6 +1182,21 @@ def main():
                 tfbq=base_q_mass.item(),
                 tfp=p_mass.item(),
             )
+        if args.verifier_decision_weight > 0:
+            h, candidates, _ = sample_target_frontier(accept_records, target_frontier_candidates, target_frontier_ps, target_frontier_idx, args.batch_size, device, rng, target_frontier_weights)
+            vals = verifier_decision_loss(model, output_weight, h, candidates, args.verifier_preserve_weight)
+            decision_loss, reject_loss, preserve_loss, base_kl, delta_norm, accept, base_accept, preserve, rescue = vals
+            loss = loss + args.verifier_decision_weight * decision_loss
+            kl_terms.append(base_kl); dn_terms.append(delta_norm)
+            metrics.update(
+                vdl=decision_loss.item(),
+                vdr=reject_loss.item(),
+                vdp=preserve_loss.item(),
+                va=accept.item(),
+                vba=base_accept.item(),
+                vpr=preserve.item(),
+                vrs=rescue.item(),
+            )
         if kl_terms:
             loss = loss + args.base_kl_weight * torch.stack(kl_terms).mean()
             loss = loss + args.delta_norm_weight * torch.stack(dn_terms).mean()
@@ -1047,11 +1205,36 @@ def main():
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        if args.eval_every > 0 and step % args.eval_every == 0:
+            if validation is not None:
+                current_eval = verifier_accept_metrics(
+                    model, output_weight, validation_records, val_target_idx,
+                    val_target_candidates, args.batch_size, device)
+            else:
+                current_eval = verifier_accept_metrics(
+                    model, output_weight, accept_records, target_frontier_idx,
+                    target_frontier_candidates, args.batch_size, device)
+            current_metric = (current_eval["verifier_accept"], -current_eval["verifier_changed"])
+            if current_metric > best_metric:
+                best_metric = current_metric
+                best_step = step
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            print(json.dumps({"event": "validation", "step": step, **current_eval}), flush=True)
+            model.train()
         if step % 25 == 0:
             parts = " ".join(f"{k}={v:.3f}" for k, v in metrics.items())
             progress.set_description(f"loss={loss.item():.4f} {parts}")
 
-    eval_end = eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, target_frontier_weights, label, token_to_local, args, device)
+    model.load_state_dict(best_state, strict=True)
+    if validation is not None:
+        eval_end = verifier_accept_metrics(
+            model, output_weight, validation_records, val_target_idx,
+            val_target_candidates, args.batch_size, device)
+    else:
+        eval_end = verifier_accept_metrics(
+            model, output_weight, accept_records, target_frontier_idx,
+            target_frontier_candidates, args.batch_size, device)
+    eval_end["best_step"] = best_step
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     torch.save({"format": "mtp-direct-lowrank-v1", "args": vars(args), "fr_vocab_size": int(len(fr_ids)), "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()}, "eval_end": eval_end}, args.out)
     print(json.dumps({"event": "done", "seconds": time.perf_counter() - t0, "eval_end": eval_end, "out": args.out}), flush=True)
