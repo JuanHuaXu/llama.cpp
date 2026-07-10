@@ -253,6 +253,26 @@ def rank_flip_loss(model, output_weight, h, correct, draft, p_min, margin, rank_
     return loss, base_kl, delta_norm, flip, base_flip, selected_flip, selected, selected_rank, correct_p.mean(), draft_p.mean(), correct_continue
 
 
+def pairwise_rank_flip_loss(model, output_weight, h, correct, draft, margin):
+    z, z_base, delta = model(h, return_parts=True)
+    z = z.float()
+    z_base = z_base.float()
+    w_correct = output_weight[correct].float()
+    w_draft = output_weight[draft].float()
+    correct_logit = (z * w_correct).sum(dim=1)
+    draft_logit = (z * w_draft).sum(dim=1)
+    base_correct_logit = (z_base * w_correct).sum(dim=1)
+    base_draft_logit = (z_base * w_draft).sum(dim=1)
+    loss = F.relu(margin - (correct_logit - draft_logit)).mean()
+    delta_norm = delta.float().pow(2).mean()
+    with torch.no_grad():
+        flip = (correct_logit > draft_logit).float().mean()
+        base_flip = (base_correct_logit > base_draft_logit).float().mean()
+        margin_mean = (correct_logit - draft_logit).mean()
+        base_margin_mean = (base_correct_logit - base_draft_logit).mean()
+    return loss, delta_norm, flip, base_flip, margin_mean, base_margin_mean
+
+
 def recursive_chain_loss(model, output_weight, h, y, p_min):
     logits, base_logits, delta = logits_for(model, output_weight, h, return_parts=True)
     logits_f = logits.float()
@@ -359,11 +379,30 @@ def accepted_chain_weights(accept_records, pos_idx, runtime_depth, bonus, power)
     return weights
 
 
-def build_indices(static_records, accept_records, label, runtime_depth, token_to_local, chain_bonus=0.0, chain_power=0.0):
+def build_candidate_frontier_indices(accept_records, corr_targets, token_to_local, runtime_depth, candidate_rank_max):
+    if accept_records is None or "candidate_ids" not in accept_records.dtype.names:
+        return np.array([], dtype=np.int64)
+
+    toks = np.asarray(accept_records["draft_token"], dtype=np.int64)
+    draft_local = token_to_local[toks]
+    row_type_mask = accept_records["row_type"] == 0 if "row_type" in accept_records.dtype.names else np.ones(len(accept_records), dtype=bool)
+    depth_mask = accept_records["depth"] == (runtime_depth - 1)
+    verified_reject = (accept_records["verified"] == 1) & (accept_records["accepted"] == 0)
+    target = np.asarray(accept_records["target_token"], dtype=np.int64)
+    candidate_hits = np.asarray(accept_records["candidate_ids"], dtype=np.int64) == target[:, None]
+    target_in_frontier = candidate_hits.any(axis=1)
+    if candidate_rank_max > 0:
+        target_rank = np.where(target_in_frontier, candidate_hits.argmax(axis=1) + 1, 0)
+        target_in_frontier &= target_rank <= candidate_rank_max
+    return np.nonzero(row_type_mask & depth_mask & verified_reject & target_in_frontier & (corr_targets >= 0) & (draft_local >= 0))[0]
+
+
+def build_indices(static_records, accept_records, label, runtime_depth, token_to_local, chain_bonus=0.0, chain_power=0.0, candidate_rank_max=0):
     static_idx = np.array([], dtype=np.int64)
     pos_idx = np.array([], dtype=np.int64)
     neg_idx = np.array([], dtype=np.int64)
     corr_idx = np.array([], dtype=np.int64)
+    candidate_idx = np.array([], dtype=np.int64)
     corr_targets = build_reject_correct_targets(accept_records, token_to_local)
     if static_records is not None:
         labels = np.asarray(static_records[label], dtype=np.int64)
@@ -378,11 +417,12 @@ def build_indices(static_records, accept_records, label, runtime_depth, token_to
         neg_idx = np.nonzero(row_type_mask & depth_mask & verified & (accept_records["accepted"] == 0) & in_vocab)[0]
         draft_local = token_to_local[toks]
         corr_idx = np.nonzero(row_type_mask & depth_mask & verified & (accept_records["accepted"] == 0) & (corr_targets >= 0) & (draft_local >= 0))[0]
+        candidate_idx = build_candidate_frontier_indices(accept_records, corr_targets, token_to_local, runtime_depth, candidate_rank_max)
     pos_weights = accepted_chain_weights(accept_records, pos_idx, runtime_depth, chain_bonus, chain_power) if accept_records is not None else None
-    return static_idx, pos_idx, neg_idx, corr_idx, corr_targets, pos_weights
+    return static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, corr_targets, pos_weights
 
 
-def eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, corr_targets, label, token_to_local, args, device):
+def eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, corr_targets, label, token_to_local, args, device):
     rng = np.random.default_rng(args.seed + 99)
     out = {}
     model.eval()
@@ -416,6 +456,16 @@ def eval_split(model, output_weight, static_records, accept_records, static_idx,
                 corr_rank_draft_p=float(vals[9].item()),
                 corr_rank_continue=float(vals[10].item()),
             )
+        if len(candidate_idx):
+            h, correct, draft = sample_accept_target_pairs(accept_records, corr_targets, token_to_local, candidate_idx, args.batch_size, device, rng)
+            vals = pairwise_rank_flip_loss(model, output_weight, h, correct, draft, args.candidate_rank_margin)
+            out.update(
+                candidate_rank_flip_loss=float(vals[0].item()),
+                candidate_rank_flip=float(vals[2].item()),
+                candidate_base_rank_flip=float(vals[3].item()),
+                candidate_margin=float(vals[4].item()),
+                candidate_base_margin=float(vals[5].item()),
+            )
     model.train()
     return out
 
@@ -447,6 +497,9 @@ def main():
     ap.add_argument("--reject-rank-flip-weight", type=float, default=0.0)
     ap.add_argument("--reject-rank-margin", type=float, default=0.25)
     ap.add_argument("--reject-rank-max", type=int, default=20, help="only rank-flip rejects whose verifier token is within this base local-vocab rank; <=0 disables filtering")
+    ap.add_argument("--candidate-rank-flip-weight", type=float, default=0.0)
+    ap.add_argument("--candidate-rank-margin", type=float, default=0.15)
+    ap.add_argument("--candidate-rank-max", type=int, default=8, help="only rank-flip rejects whose verifier token is within this dumped sampler-candidate rank; <=0 disables filtering")
     ap.add_argument("--base-kl-weight", type=float, default=0.02)
     ap.add_argument("--delta-norm-weight", type=float, default=0.0002)
     ap.add_argument("--p-min", type=float, default=0.1)
@@ -500,7 +553,7 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     rng = np.random.default_rng(args.seed)
 
-    static_idx, pos_idx, neg_idx, corr_idx, corr_targets, pos_weights = build_indices(
+    static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, corr_targets, pos_weights = build_indices(
         static_records,
         accept_records,
         label,
@@ -508,6 +561,7 @@ def main():
         token_to_local,
         args.accepted_chain_bonus,
         args.accepted_chain_power,
+        args.candidate_rank_max,
     )
     if args.static_weight > 0 and len(static_idx) == 0:
         raise ValueError("static CE requested but no static rows survive the FR vocab")
@@ -521,6 +575,8 @@ def main():
         raise ValueError("reject correction requested but no recoverable verified rejected rows survive the FR vocab")
     if args.reject_rank_flip_weight > 0 and len(corr_idx) == 0:
         raise ValueError("reject rank-flip requested but no recoverable verified rejected rows survive the FR vocab")
+    if args.candidate_rank_flip_weight > 0 and len(candidate_idx) == 0:
+        raise ValueError("candidate rank-flip requested but no verified rejected rows have the verifier token in dumped candidates")
 
     pos_weight_summary = None
     if pos_weights is not None:
@@ -529,8 +585,8 @@ def main():
             "mean": float(pos_weights.mean()),
             "max": float(pos_weights.max()),
         }
-    print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx)), "recursive_corr": int(len(corr_idx)), "pos_weight_summary": pos_weight_summary}), flush=True)
-    print(json.dumps({"event": "eval_start", **eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, corr_targets, label, token_to_local, args, device)}), flush=True)
+    print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx)), "recursive_corr": int(len(corr_idx)), "candidate_corr": int(len(candidate_idx)), "pos_weight_summary": pos_weight_summary}), flush=True)
+    print(json.dumps({"event": "eval_start", **eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, corr_targets, label, token_to_local, args, device)}), flush=True)
 
     t0 = time.perf_counter()
     progress = tqdm(range(1, args.steps + 1), dynamic_ncols=True)
@@ -598,6 +654,19 @@ def main():
                 fdp=draft_p.item(),
                 fc=correct_continue.item(),
             )
+        if args.candidate_rank_flip_weight > 0:
+            h, correct, draft = sample_accept_target_pairs(accept_records, corr_targets, token_to_local, candidate_idx, args.batch_size, device, rng)
+            vals = pairwise_rank_flip_loss(model, output_weight, h, correct, draft, args.candidate_rank_margin)
+            flip_loss, delta_norm, flip, base_flip, margin_mean, base_margin_mean = vals
+            loss = loss + args.candidate_rank_flip_weight * flip_loss
+            dn_terms.append(delta_norm)
+            metrics.update(
+                cflip=flip_loss.item(),
+                cf=flip.item(),
+                cbf=base_flip.item(),
+                cm=margin_mean.item(),
+                cbm=base_margin_mean.item(),
+            )
         if kl_terms:
             loss = loss + args.base_kl_weight * torch.stack(kl_terms).mean()
             loss = loss + args.delta_norm_weight * torch.stack(dn_terms).mean()
@@ -610,7 +679,7 @@ def main():
             parts = " ".join(f"{k}={v:.3f}" for k, v in metrics.items())
             progress.set_description(f"loss={loss.item():.4f} {parts}")
 
-    eval_end = eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, corr_targets, label, token_to_local, args, device)
+    eval_end = eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, corr_targets, label, token_to_local, args, device)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     torch.save({"format": "mtp-direct-lowrank-v1", "args": vars(args), "fr_vocab_size": int(len(fr_ids)), "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()}, "eval_end": eval_end}, args.out)
     print(json.dumps({"event": "done", "seconds": time.perf_counter() - t0, "eval_end": eval_end, "out": args.out}), flush=True)
