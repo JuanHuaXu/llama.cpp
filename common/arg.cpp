@@ -3969,6 +3969,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LOGIT_BIAS"));
     add_opt(common_arg(
+        {"--spec-mtp-target-accept-top-k"}, "N",
+        "accept draft-MTP tokens that appear in the target sampler top-k instead of requiring exact sampled-token match (0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_target_accept_top_k = std::stoi(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_TARGET_ACCEPT_TOP_K"));
+    add_opt(common_arg(
+        {"--spec-mtp-target-accept-p-min"}, "P",
+        "minimum target sampler probability for --spec-mtp-target-accept-top-k (default: 0.0)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_target_accept_p_min = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_TARGET_ACCEPT_P_MIN"));
+    add_opt(common_arg(
         {"--spec-mtp-fr-vocab"}, "FNAME",
         "frequency-ranked token allowlist for draft-MTP candidate selection",
         [](common_params & params, const std::string & value) {

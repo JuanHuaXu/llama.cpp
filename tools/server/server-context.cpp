@@ -3840,7 +3840,15 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 std::vector<common_sampler_accept_trace> accept_trace;
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, &accept_trace);
+                auto accepted = common_sampler_sample_and_accept_n(
+                        slot.smpl.get(),
+                        slot.ctx_tgt,
+                        slot.spec_i_batch,
+                        slot.spec_draft,
+                        false,
+                        &accept_trace,
+                        params_base.speculative.draft.mtp_target_accept_top_k,
+                        params_base.speculative.draft.mtp_target_accept_p_min);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

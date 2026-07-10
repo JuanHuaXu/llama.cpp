@@ -362,6 +362,9 @@ struct common_params_speculative_draft {
     float mtp_state_head_scale = 1.0f; // blend factor for direct-state hidden steering
     std::string mtp_logit_bias; // optional draft-only token logit bias file
 
+    int32_t mtp_target_accept_top_k = 0; // accept a draft token if target ranks it within this top-k (0 = strict sampled-token match)
+    float mtp_target_accept_p_min = 0.0f; // minimum target probability for --spec-mtp-target-accept-top-k
+
     std::string mtp_fr_vocab; // optional frequency-ranked token allowlist for MTP drafting
     uint32_t mtp_fr_top_k = 256; // sampler candidates scanned when the allowlist is active
     bool mtp_fr_prompt_tokens = true; // also allow recent prompt/generated tokens outside the allowlist

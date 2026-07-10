@@ -95,7 +95,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         const std::vector<int> & idxs,
         const llama_tokens & draft,
         bool grammar_first = false,
-        std::vector<common_sampler_accept_trace> * trace = nullptr);
+        std::vector<common_sampler_accept_trace> * trace = nullptr,
+        int32_t draft_accept_top_k = 0,
+        float draft_accept_p_min = 0.0f);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(
@@ -103,7 +105,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct llama_context * ctx,
         const llama_tokens & draft,
         bool grammar_first = false,
-        std::vector<common_sampler_accept_trace> * trace = nullptr);
+        std::vector<common_sampler_accept_trace> * trace = nullptr,
+        int32_t draft_accept_top_k = 0,
+        float draft_accept_p_min = 0.0f);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
