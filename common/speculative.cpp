@@ -1371,6 +1371,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     uint64_t mtp_fr_replaced = 0;
     uint64_t mtp_fr_blocked = 0;
     uint64_t mtp_fr_prompt_allowed = 0;
+    std::vector<float> mtp_logit_bias;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -1385,6 +1386,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
         init_mtp_fr_vocab();
+        init_mtp_logit_bias();
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -1576,6 +1578,53 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 (int) params.mtp_fr_prompt_tokens, params.mtp_fr_prompt_context);
     }
 
+
+    void init_mtp_logit_bias() {
+        if (params.mtp_logit_bias.empty()) {
+            return;
+        }
+
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(params.ctx_dft));
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+        std::ifstream in(params.mtp_logit_bias);
+        if (!in.is_open()) {
+            throw std::runtime_error("failed to open MTP logit bias file: " + params.mtp_logit_bias);
+        }
+
+        uint64_t loaded = 0;
+        std::string line;
+        while (std::getline(in, line)) {
+            const size_t comment = line.find('#');
+            if (comment != std::string::npos) {
+                line.resize(comment);
+            }
+
+            char * end = nullptr;
+            const long token = std::strtol(line.c_str(), &end, 10);
+            if (end == line.c_str()) {
+                continue;
+            }
+
+            const float bias = std::strtof(end, &end);
+            if (token < 0 || token >= n_vocab || !std::isfinite(bias) || bias == 0.0f) {
+                continue;
+            }
+
+            if (mtp_logit_bias.empty()) {
+                mtp_logit_bias.assign((size_t) n_vocab, 0.0f);
+            }
+            mtp_logit_bias[(size_t) token] = bias;
+            ++loaded;
+        }
+
+        if (loaded == 0) {
+            throw std::runtime_error("MTP logit bias file did not contain any valid rows: " + params.mtp_logit_bias);
+        }
+
+        SPC_INF("MTP draft logit bias enabled: path='%s', rows=%" PRIu64 "\n",
+                params.mtp_logit_bias.c_str(), loaded);
+    }
     bool mtp_fr_prompt_has_token(const common_speculative_draft_params & dp, llama_token id) const {
         if (!params.mtp_fr_prompt_tokens || dp.prompt == nullptr || params.mtp_fr_prompt_context == 0) {
             return false;
@@ -1620,12 +1669,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return LLAMA_TOKEN_NULL;
         }
 
-        if (mtp_fr_allowed.empty()) {
+        if (mtp_fr_allowed.empty() && mtp_logit_bias.empty()) {
             p_selected = cur_p->data[0].p;
             return cur_p->data[0].id;
         }
 
-        ++mtp_fr_queries;
+        if (!mtp_fr_allowed.empty()) {
+            ++mtp_fr_queries;
+        }
+
+        llama_token best_id = LLAMA_TOKEN_NULL;
+        float best_p = 0.0f;
+        double best_score = -INFINITY;
+        size_t best_k = 0;
+        bool best_allowed_by_prompt = false;
+
         for (size_t k = 0; k < cur_p->size; ++k) {
             bool allowed_by_prompt = false;
             const llama_token id = cur_p->data[k].id;
@@ -1633,21 +1691,46 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            p_selected = cur_p->data[k].p;
-            if (k == 0) {
+            const float p = std::isfinite(cur_p->data[k].p) ? cur_p->data[k].p : 0.0f;
+            double score = std::log((double) std::max(p, 1.0e-9f));
+            if (id >= 0 && (size_t) id < mtp_logit_bias.size()) {
+                score += mtp_logit_bias[(size_t) id];
+            }
+
+            if (best_id == LLAMA_TOKEN_NULL || score > best_score) {
+                best_id = id;
+                best_p = p;
+                best_score = score;
+                best_k = k;
+                best_allowed_by_prompt = allowed_by_prompt;
+            }
+        }
+
+        if (best_id == LLAMA_TOKEN_NULL) {
+            if (!mtp_fr_allowed.empty()) {
+                ++mtp_fr_blocked;
+            }
+            p_selected = 0.0f;
+            return LLAMA_TOKEN_NULL;
+        }
+
+        if (!mtp_fr_allowed.empty()) {
+            if (best_k == 0) {
                 ++mtp_fr_first_allowed;
             } else {
                 ++mtp_fr_replaced;
             }
-            if (allowed_by_prompt) {
+            if (best_allowed_by_prompt) {
                 ++mtp_fr_prompt_allowed;
             }
-            return id;
         }
 
-        ++mtp_fr_blocked;
-        p_selected = 0.0f;
-        return LLAMA_TOKEN_NULL;
+        if (!mtp_logit_bias.empty()) {
+            p_selected = (float) std::min(1.0, std::exp(best_score));
+        } else {
+            p_selected = best_p;
+        }
+        return best_id;
     }
 
     void maybe_log_mtp_fr_stats() const {

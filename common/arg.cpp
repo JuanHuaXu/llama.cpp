@@ -3962,6 +3962,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_STATE_HEAD_SCALE"));
     add_opt(common_arg(
+        {"--spec-mtp-logit-bias"}, "FNAME",
+        "draft-only MTP logit bias file with token_id bias rows",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_logit_bias = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LOGIT_BIAS"));
+    add_opt(common_arg(
         {"--spec-mtp-fr-vocab"}, "FNAME",
         "frequency-ranked token allowlist for draft-MTP candidate selection",
         [](common_params & params, const std::string & value) {

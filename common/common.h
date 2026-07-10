@@ -360,6 +360,7 @@ struct common_params_speculative_draft {
     bool mtp_lora_state = false; // apply MTP hidden LoRA to recursive h_nextn instead of logits only
     std::string mtp_state_head; // optional direct-state head used to steer draft-MTP hidden rows
     float mtp_state_head_scale = 1.0f; // blend factor for direct-state hidden steering
+    std::string mtp_logit_bias; // optional draft-only token logit bias file
 
     std::string mtp_fr_vocab; // optional frequency-ranked token allowlist for MTP drafting
     uint32_t mtp_fr_top_k = 256; // sampler candidates scanned when the allowlist is active
