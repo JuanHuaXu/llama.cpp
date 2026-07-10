@@ -263,8 +263,11 @@ def sample_draft_vs_target_pairs(records, target_local, token_to_local, idx, bat
     return h, correct, draft
 
 
-def sample_target_frontier(records, target_candidates_local, target_candidate_ps, idx, batch_size, device, rng):
-    chosen = rng.choice(idx, size=batch_size, replace=len(idx) < batch_size)
+def sample_target_frontier(records, target_candidates_local, target_candidate_ps, idx, batch_size, device, rng, weights=None):
+    p = None
+    if weights is not None:
+        p = weights / weights.sum()
+    chosen = rng.choice(idx, size=batch_size, replace=len(idx) < batch_size, p=p)
     batch = records[chosen]
     h = rows_to_h(batch, device)
     candidates = torch.from_numpy(target_candidates_local[chosen].astype(np.int64)).to(device=device)
@@ -518,6 +521,28 @@ def rejected_chain_weights(accept_records, idx, bonus, power):
     return weights
 
 
+def target_frontier_chain_weights(accept_records, idx, bonus, power):
+    if len(idx) == 0 or (bonus <= 0 and power <= 0):
+        return None
+    depth = np.asarray(accept_records[idx]["depth"], dtype=np.float32)
+    accepted = np.asarray(accept_records[idx]["accepted"], dtype=np.float32)
+    n_accepted = np.asarray(accept_records[idx]["n_accepted"], dtype=np.float32)
+    n_drafted = np.asarray(accept_records[idx]["n_drafted"], dtype=np.float32)
+    remaining = np.maximum(n_drafted - depth, 1.0)
+    # Accepted rows preserve the already-safe chain; rejected rows are weighted by
+    # the draft work a correct target-overlap update could stop wasting.
+    utility = np.where(accepted > 0.0, np.maximum(n_accepted - depth, 1.0), remaining)
+    weights = np.ones(len(idx), dtype=np.float64)
+    if bonus > 0:
+        weights *= 1.0 + bonus * utility
+    if power > 0:
+        weights *= utility ** power
+    total = weights.sum()
+    if not np.isfinite(total) or total <= 0:
+        return None
+    return weights
+
+
 def build_candidate_frontier_indices(accept_records, corr_targets, token_to_local, runtime_depth, candidate_rank_max):
     if accept_records is None or "candidate_ids" not in accept_records.dtype.names:
         return np.array([], dtype=np.int64)
@@ -589,7 +614,7 @@ def build_target_frontier_indices(accept_records, token_to_local, runtime_depth)
     return idx, local, ps
 
 
-def build_indices(static_records, accept_records, label, runtime_depth, token_to_local, chain_bonus=0.0, chain_power=0.0, chain_utility_bonus=0.0, chain_utility_power=0.0, reject_utility_bonus=0.0, reject_utility_power=0.0, candidate_rank_max=0):
+def build_indices(static_records, accept_records, label, runtime_depth, token_to_local, chain_bonus=0.0, chain_power=0.0, chain_utility_bonus=0.0, chain_utility_power=0.0, reject_utility_bonus=0.0, reject_utility_power=0.0, target_utility_bonus=0.0, target_utility_power=0.0, candidate_rank_max=0):
     static_idx = np.array([], dtype=np.int64)
     pos_idx = np.array([], dtype=np.int64)
     neg_idx = np.array([], dtype=np.int64)
@@ -622,10 +647,11 @@ def build_indices(static_records, accept_records, label, runtime_depth, token_to
     pos_weights = accepted_chain_weights(accept_records, pos_idx, runtime_depth, chain_bonus, chain_power, chain_utility_bonus, chain_utility_power) if accept_records is not None else None
     corr_weights = rejected_chain_weights(accept_records, corr_idx, reject_utility_bonus, reject_utility_power) if accept_records is not None else None
     candidate_weights = rejected_chain_weights(accept_records, candidate_idx, reject_utility_bonus, reject_utility_power) if accept_records is not None else None
-    return static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, pos_weights, corr_weights, candidate_weights
+    target_frontier_weights = target_frontier_chain_weights(accept_records, target_frontier_idx, target_utility_bonus, target_utility_power) if accept_records is not None else None
+    return static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, pos_weights, corr_weights, candidate_weights, target_frontier_weights
 
 
-def eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, label, token_to_local, args, device):
+def eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, target_frontier_weights, label, token_to_local, args, device):
     rng = np.random.default_rng(args.seed + 99)
     out = {}
     model.eval()
@@ -680,7 +706,7 @@ def eval_split(model, output_weight, static_records, accept_records, static_idx,
                 accepted_frontier_base_margin=float(vals[5].item()),
             )
         if len(target_frontier_idx):
-            h, candidates, ps = sample_target_frontier(accept_records, target_frontier_candidates, target_frontier_ps, target_frontier_idx, args.batch_size, device, rng)
+            h, candidates, ps = sample_target_frontier(accept_records, target_frontier_candidates, target_frontier_ps, target_frontier_idx, args.batch_size, device, rng, target_frontier_weights)
             vals = target_overlap_loss(model, output_weight, h, candidates, ps, args.target_overlap_mode == "renorm")
             out.update(
                 target_overlap_loss=float(vals[0].item()),
@@ -733,6 +759,8 @@ def main():
     ap.add_argument("--accepted-frontier-margin", type=float, default=0.10)
     ap.add_argument("--target-overlap-weight", type=float, default=0.0, help="maximize draft probability overlap with verifier top-k candidates from MTPACC6 dumps")
     ap.add_argument("--target-overlap-mode", choices=["renorm", "lk"], default="renorm", help="renorm matches historical top-k proxy; lk preserves missing target mass as acceptance loss")
+    ap.add_argument("--target-overlap-chain-utility-bonus", type=float, default=0.0, help="oversample verifier-overlap rows by accepted-chain utility")
+    ap.add_argument("--target-overlap-chain-utility-power", type=float, default=0.0, help="power-law verifier-overlap oversampling by accepted-chain utility")
     ap.add_argument("--base-kl-weight", type=float, default=0.02)
     ap.add_argument("--delta-norm-weight", type=float, default=0.0002)
     ap.add_argument("--p-min", type=float, default=0.1)
@@ -786,7 +814,7 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     rng = np.random.default_rng(args.seed)
 
-    static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, pos_weights, corr_weights, candidate_weights = build_indices(
+    static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, pos_weights, corr_weights, candidate_weights, target_frontier_weights = build_indices(
         static_records,
         accept_records,
         label,
@@ -798,6 +826,8 @@ def main():
         args.accepted_chain_utility_power,
         args.reject_chain_utility_bonus,
         args.reject_chain_utility_power,
+        args.target_overlap_chain_utility_bonus,
+        args.target_overlap_chain_utility_power,
         args.candidate_rank_max,
     )
     if args.static_weight > 0 and len(static_idx) == 0:
@@ -830,8 +860,8 @@ def main():
             "max": float(weights.max()),
         }
 
-    print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx)), "recursive_corr": int(len(corr_idx)), "candidate_corr": int(len(candidate_idx)), "frontier_preserve": int(len(preserve_idx)), "target_frontier": int(len(target_frontier_idx)), "pos_weight_summary": weight_summary(pos_weights), "corr_weight_summary": weight_summary(corr_weights), "candidate_weight_summary": weight_summary(candidate_weights)}), flush=True)
-    print(json.dumps({"event": "eval_start", **eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, label, token_to_local, args, device)}), flush=True)
+    print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx)), "recursive_corr": int(len(corr_idx)), "candidate_corr": int(len(candidate_idx)), "frontier_preserve": int(len(preserve_idx)), "target_frontier": int(len(target_frontier_idx)), "pos_weight_summary": weight_summary(pos_weights), "corr_weight_summary": weight_summary(corr_weights), "candidate_weight_summary": weight_summary(candidate_weights), "target_frontier_weight_summary": weight_summary(target_frontier_weights)}), flush=True)
+    print(json.dumps({"event": "eval_start", **eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, target_frontier_weights, label, token_to_local, args, device)}), flush=True)
 
     t0 = time.perf_counter()
     progress = tqdm(range(1, args.steps + 1), dynamic_ncols=True)
@@ -941,7 +971,7 @@ def main():
                 pbm=base_margin_mean.item(),
             )
         if args.target_overlap_weight > 0:
-            h, candidates, ps = sample_target_frontier(accept_records, target_frontier_candidates, target_frontier_ps, target_frontier_idx, args.batch_size, device, rng)
+            h, candidates, ps = sample_target_frontier(accept_records, target_frontier_candidates, target_frontier_ps, target_frontier_idx, args.batch_size, device, rng, target_frontier_weights)
             vals = target_overlap_loss(model, output_weight, h, candidates, ps, args.target_overlap_mode == "renorm")
             overlap_loss, base_kl, delta_norm, overlap, base_overlap, q_mass, p_mass = vals
             loss = loss + args.target_overlap_weight * overlap_loss
@@ -965,7 +995,7 @@ def main():
             parts = " ".join(f"{k}={v:.3f}" for k, v in metrics.items())
             progress.set_description(f"loss={loss.item():.4f} {parts}")
 
-    eval_end = eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, label, token_to_local, args, device)
+    eval_end = eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, candidate_idx, preserve_idx, target_frontier_idx, corr_targets, preserve_targets, target_frontier_candidates, target_frontier_ps, target_frontier_weights, label, token_to_local, args, device)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     torch.save({"format": "mtp-direct-lowrank-v1", "args": vars(args), "fr_vocab_size": int(len(fr_ids)), "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()}, "eval_end": eval_end}, args.out)
     print(json.dumps({"event": "done", "seconds": time.perf_counter() - t0, "eval_end": eval_end, "out": args.out}), flush=True)
