@@ -1350,6 +1350,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mtp_hidden_lora  (params.mtp_hidden_lora),
     mtp_hidden_lora_scale(params.mtp_hidden_lora_scale),
+    mtp_hidden_lora_state(params.mtp_hidden_lora_state),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),

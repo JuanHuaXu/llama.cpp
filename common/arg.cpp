@@ -3897,6 +3897,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LORA_DEPTH3"));
     add_opt(common_arg(
+        {"--spec-mtp-lora-state"},
+        {"--no-spec-mtp-lora-state"},
+        string_format("apply MTP hidden LoRA before exporting h_nextn so it steers recursive state (default: %s)",
+                      params.speculative.draft.mtp_lora_state ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.mtp_lora_state = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LORA_STATE"));
+    add_opt(common_arg(
         {"--spec-mtp-state-head"}, "FNAME",
         "direct-state head used to steer draft-MTP hidden rows between drafted tokens",
         [](common_params & params, const std::string & value) {

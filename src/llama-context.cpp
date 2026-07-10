@@ -1170,6 +1170,14 @@ void llama_context::set_mtp_hidden_lora(llama_adapter_lora * adapter, float scal
     mtp_hidden_lora_scale = scale;
 }
 
+void llama_context::set_mtp_hidden_lora_state(bool value) {
+    if (mtp_hidden_lora_state == value) {
+        return;
+    }
+
+    mtp_hidden_lora_state = value;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -2425,6 +2433,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras                 =*/ loras.get(),
         /*.mtp_hidden_lora       =*/ mtp_hidden_lora,
         /*.mtp_hidden_lora_scale =*/ mtp_hidden_lora_scale,
+        /*.mtp_hidden_lora_state =*/ mtp_hidden_lora_state,
         /*.mctx                  =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
@@ -3725,6 +3734,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 void llama_set_mtp_hidden_lora(llama_context * ctx, llama_adapter_lora * adapter, float scale) {
     ctx->set_mtp_hidden_lora(adapter, scale);
+}
+
+void llama_set_mtp_hidden_lora_state(llama_context * ctx, bool value) {
+    ctx->set_mtp_hidden_lora_state(value);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

@@ -677,6 +677,7 @@ struct llm_graph_params {
     const llama_adapter_loras       * loras;
     const llama_adapter_lora_weight * mtp_hidden_lora;
     float mtp_hidden_lora_scale = 1.0f;
+    bool mtp_hidden_lora_state = false;
     const llama_memory_context_i    * mctx;
     const llama_cross            * cross;
 
@@ -775,6 +776,7 @@ struct llm_graph_params {
             loras == other.loras &&
             mtp_hidden_lora       == other.mtp_hidden_lora &&
             mtp_hidden_lora_scale == other.mtp_hidden_lora_scale &&
+            mtp_hidden_lora_state == other.mtp_hidden_lora_state &&
             cross == other.cross;
     }
 };
@@ -910,6 +912,7 @@ struct llm_graph_context {
     const llama_adapter_loras       * loras;
     const llama_adapter_lora_weight * mtp_hidden_lora;
     float mtp_hidden_lora_scale = 1.0f;
+    bool mtp_hidden_lora_state = false;
     const llama_memory_context_i    * mctx;
     const llama_cross            * cross;
 

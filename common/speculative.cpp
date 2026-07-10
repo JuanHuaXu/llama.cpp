@@ -1429,6 +1429,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const bool dump_draft_rows = !this->params.mtp_train_dump.empty() && this->params.mtp_train_dump_source == "draft";
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !dump_draft_rows);
+        llama_set_mtp_hidden_lora_state(ctx_dft, this->params.mtp_lora_state);
 
         if (this->params.mtp_engram_layer_cache) {
             const int32_t n_layer_tgt = llama_model_n_layer(llama_get_model(ctx_tgt));

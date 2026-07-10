@@ -104,6 +104,10 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // This bypasses regular LoRA graph plumbing so only the MTP hidden row is adjusted.
 LLAMA_API void llama_set_mtp_hidden_lora(struct llama_context * ctx, struct llama_adapter_lora * adapter, float scale);
 
+// Apply the MTP hidden adapter before h_nextn is exported, so recursive MTP
+// drafting consumes the adapted state. Default false keeps legacy logits-only use.
+LLAMA_API void llama_set_mtp_hidden_lora_state(struct llama_context * ctx, bool value);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
