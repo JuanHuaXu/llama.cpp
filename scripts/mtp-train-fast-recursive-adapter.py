@@ -159,8 +159,11 @@ def sample_static(records, idx, label, token_to_local, batch_size, device, rng):
     return h, y
 
 
-def sample_accept(records, idx, token_to_local, batch_size, device, rng):
-    chosen = rng.choice(idx, size=batch_size, replace=len(idx) < batch_size)
+def sample_accept(records, idx, token_to_local, batch_size, device, rng, weights=None):
+    p = None
+    if weights is not None:
+        p = weights / weights.sum()
+    chosen = rng.choice(idx, size=batch_size, replace=len(idx) < batch_size, p=p)
     batch = records[chosen]
     h = rows_to_h(batch, device)
     y_np = token_to_local[np.asarray(batch["draft_token"], dtype=np.int64)]
@@ -307,7 +310,23 @@ def build_reject_correct_targets(accept_records, token_to_local):
     return target_local
 
 
-def build_indices(static_records, accept_records, label, runtime_depth, token_to_local):
+def accepted_chain_weights(accept_records, pos_idx, runtime_depth, bonus, power):
+    if len(pos_idx) == 0 or (bonus <= 0 and power <= 0):
+        return None
+    n_acc = np.asarray(accept_records[pos_idx]["n_accepted"], dtype=np.float32)
+    survival = np.maximum(n_acc - runtime_depth, 0.0)
+    weights = np.ones(len(pos_idx), dtype=np.float64)
+    if bonus > 0:
+        weights *= 1.0 + bonus * survival
+    if power > 0:
+        weights *= np.maximum(n_acc / float(runtime_depth), 1.0) ** power
+    total = weights.sum()
+    if not np.isfinite(total) or total <= 0:
+        return None
+    return weights
+
+
+def build_indices(static_records, accept_records, label, runtime_depth, token_to_local, chain_bonus=0.0, chain_power=0.0):
     static_idx = np.array([], dtype=np.int64)
     pos_idx = np.array([], dtype=np.int64)
     neg_idx = np.array([], dtype=np.int64)
@@ -325,7 +344,8 @@ def build_indices(static_records, accept_records, label, runtime_depth, token_to
         neg_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 0) & in_vocab)[0]
         draft_local = token_to_local[toks]
         corr_idx = np.nonzero(depth_mask & verified & (accept_records["accepted"] == 0) & (corr_targets >= 0) & (draft_local >= 0))[0]
-    return static_idx, pos_idx, neg_idx, corr_idx, corr_targets
+    pos_weights = accepted_chain_weights(accept_records, pos_idx, runtime_depth, chain_bonus, chain_power) if accept_records is not None else None
+    return static_idx, pos_idx, neg_idx, corr_idx, corr_targets, pos_weights
 
 
 def eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, corr_targets, label, token_to_local, args, device):
@@ -385,6 +405,8 @@ def main():
     ap.add_argument("--recursive-continue-weight", type=float, default=0.0)
     ap.add_argument("--recursive-top-confidence-weight", type=float, default=0.0)
     ap.add_argument("--recursive-correct-margin-weight", type=float, default=0.0)
+    ap.add_argument("--accepted-chain-bonus", type=float, default=0.0, help="oversample accepted recursive rows that came from longer accepted chains")
+    ap.add_argument("--accepted-chain-power", type=float, default=0.0, help="power-law oversampling by n_accepted/runtime_depth for accepted recursive rows")
     ap.add_argument("--negative-weight", type=float, default=0.35)
     ap.add_argument("--reject-correct-weight", type=float, default=0.0)
     ap.add_argument("--reject-rank-flip-weight", type=float, default=0.0)
@@ -435,7 +457,15 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     rng = np.random.default_rng(args.seed)
 
-    static_idx, pos_idx, neg_idx, corr_idx, corr_targets = build_indices(static_records, accept_records, label, args.runtime_depth, token_to_local)
+    static_idx, pos_idx, neg_idx, corr_idx, corr_targets, pos_weights = build_indices(
+        static_records,
+        accept_records,
+        label,
+        args.runtime_depth,
+        token_to_local,
+        args.accepted_chain_bonus,
+        args.accepted_chain_power,
+    )
     if args.static_weight > 0 and len(static_idx) == 0:
         raise ValueError("static CE requested but no static rows survive the FR vocab")
     if args.recursive_weight > 0 and len(pos_idx) == 0:
@@ -447,7 +477,14 @@ def main():
     if args.reject_rank_flip_weight > 0 and len(corr_idx) == 0:
         raise ValueError("reject rank-flip requested but no recoverable verified rejected rows survive the FR vocab")
 
-    print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx)), "recursive_corr": int(len(corr_idx))}), flush=True)
+    pos_weight_summary = None
+    if pos_weights is not None:
+        pos_weight_summary = {
+            "min": float(pos_weights.min()),
+            "mean": float(pos_weights.mean()),
+            "max": float(pos_weights.max()),
+        }
+    print(json.dumps({"event": "start", "args": vars(args), "n_embd": int(n_embd), "fr_vocab": int(len(fr_ids)), "static_rows": int(len(static_idx)), "recursive_pos": int(len(pos_idx)), "recursive_neg": int(len(neg_idx)), "recursive_corr": int(len(corr_idx)), "pos_weight_summary": pos_weight_summary}), flush=True)
     print(json.dumps({"event": "eval_start", **eval_split(model, output_weight, static_records, accept_records, static_idx, pos_idx, neg_idx, corr_idx, corr_targets, label, token_to_local, args, device)}), flush=True)
 
     t0 = time.perf_counter()
@@ -464,7 +501,7 @@ def main():
             kl_terms.append(base_kl); dn_terms.append(delta_norm)
             metrics.update(sce=ce.item(), stop1=top1.item(), scp=correct_p.item(), scont=cont.item())
         if args.recursive_weight > 0 or args.recursive_continue_weight > 0 or args.recursive_top_confidence_weight > 0 or args.recursive_correct_margin_weight > 0:
-            h, y = sample_accept(accept_records, pos_idx, token_to_local, args.batch_size, device, rng)
+            h, y = sample_accept(accept_records, pos_idx, token_to_local, args.batch_size, device, rng, pos_weights)
             ce, cont_loss, top_conf_loss, corr_margin_loss, base_kl, delta_norm, top1, correct_p, cont, ccont = recursive_chain_loss(model, output_weight, h, y, args.p_min)
             loss = loss + args.recursive_weight * ce
             loss = loss + args.recursive_continue_weight * cont_loss
@@ -479,7 +516,7 @@ def main():
                 rccont=ccont.item(),
                 rcl=cont_loss.item(),
                 rtconf=top_conf_loss.item(),
-                rcm= corr_margin_loss.item(),
+                rcm=corr_margin_loss.item(),
             )
         if args.negative_weight > 0:
             h, y = sample_accept(accept_records, neg_idx, token_to_local, args.batch_size, device, rng)
