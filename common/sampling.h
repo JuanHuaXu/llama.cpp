@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,14 @@
 //
 
 struct common_sampler;
+
+static constexpr int32_t COMMON_SAMPLER_ACCEPT_TRACE_TOP_K = 8;
+
+struct common_sampler_accept_trace {
+    llama_token token = LLAMA_TOKEN_NULL;
+    std::array<llama_token, COMMON_SAMPLER_ACCEPT_TRACE_TOP_K> candidate_ids = {};
+    std::array<float,       COMMON_SAMPLER_ACCEPT_TRACE_TOP_K> candidate_ps  = {};
+};
 
 // llama_sampler API overloads
 
@@ -80,10 +89,21 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        bool grammar_first = false,
+        std::vector<common_sampler_accept_trace> * trace = nullptr);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const llama_tokens & draft,
+        bool grammar_first = false,
+        std::vector<common_sampler_accept_trace> * trace = nullptr);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

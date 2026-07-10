@@ -172,7 +172,12 @@ struct common_speculative_impl {
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
-    virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, llama_token target_token, bool is_other) = 0;
+    virtual void accept(
+            llama_seq_id seq_id,
+            uint16_t n_accepted,
+            llama_token target_token,
+            bool is_other,
+            const std::vector<common_sampler_accept_trace> * target_trace) = 0;
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -386,7 +391,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, llama_token /*target_token*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, llama_token /*target_token*/, bool /*is_other*/, const std::vector<common_sampler_accept_trace> * /*target_trace*/) override {
         // noop
     }
 
@@ -842,7 +847,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, llama_token /*target_token*/, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, llama_token /*target_token*/, bool /*is_other*/, const std::vector<common_sampler_accept_trace> * /*target_trace*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1197,7 +1202,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, llama_token /*target_token*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, llama_token /*target_token*/, bool /*is_other*/, const std::vector<common_sampler_accept_trace> * /*target_trace*/) override {
         // noop
     }
 
@@ -2120,7 +2125,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     static constexpr uint32_t mtp_accept_dump_header_bytes = 32;
-    static constexpr uint32_t mtp_accept_dump_meta_bytes = 124;
+    static constexpr uint32_t mtp_accept_dump_meta_bytes = 188;
     static constexpr uint32_t mtp_accept_dump_format_q8_row_scale = 1;
     static constexpr uint32_t mtp_state_dump_meta_bytes = 56;
     static constexpr uint32_t mtp_state_dump_format_q8_pair_scale = 1;
@@ -2230,8 +2235,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        const char magic[8] = { 'M', 'T', 'P', 'A', 'C', 'C', '5', '\0' };
-        const uint32_t version = 5;
+        const char magic[8] = { 'M', 'T', 'P', 'A', 'C', 'C', '6', '\0' };
+        const uint32_t version = 6;
 
         if (params.mtp_accept_dump_append && init_mtp_accept_dump_append(magic, version)) {
             return;
@@ -2385,7 +2390,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         mtp_accept_pending[seq_id].push_back(std::move(attempt));
     }
 
-    void dump_mtp_accept_records(llama_seq_id seq_id, uint16_t n_accepted, llama_token target_token) {
+    void dump_mtp_accept_records(
+            llama_seq_id seq_id,
+            uint16_t n_accepted,
+            llama_token target_token,
+            const std::vector<common_sampler_accept_trace> * target_trace) {
         if (((!mtp_accept_dump.is_open() || mtp_accept_dump_finished) &&
                     (!mtp_state_dump.is_open() || mtp_state_dump_finished)) ||
                 seq_id < 0 || seq_id >= (llama_seq_id) mtp_accept_pending.size()) {
@@ -2412,6 +2421,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t verified = is_draft && draft_idx <= n_acc ? 1 : 0; // after the first rejection, later chain tokens were never target-verified.
             const int32_t row_target = accepted ? (int32_t) a.draft_token : (verified ? (int32_t) target_token : -1);
             const float prob = std::isfinite(a.p) ? a.p : 0.0f;
+            std::array<int32_t, MTP_ACCEPT_DUMP_TOP_K> target_candidate_ids = {};
+            std::array<float,   MTP_ACCEPT_DUMP_TOP_K> target_candidate_ps  = {};
+            target_candidate_ids.fill((int32_t) LLAMA_TOKEN_NULL);
+            target_candidate_ps.fill(0.0f);
+            if (target_trace != nullptr && verified && draft_idx >= 0 && draft_idx < (int32_t) target_trace->size()) {
+                const auto & trace = target_trace->at((size_t) draft_idx);
+                for (int32_t k = 0; k < MTP_ACCEPT_DUMP_TOP_K; ++k) {
+                    target_candidate_ids[(size_t) k] = (int32_t) trace.candidate_ids[(size_t) k];
+                    target_candidate_ps[(size_t) k] = trace.candidate_ps[(size_t) k];
+                }
+            }
 
             if (mtp_accept_dump.is_open() && !mtp_accept_dump_finished) {
                 mtp_accept_dump_write_scalar(batch_id);
@@ -2432,6 +2452,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
                 for (int32_t k = 0; k < MTP_ACCEPT_DUMP_TOP_K; ++k) {
                     mtp_accept_dump_write_scalar(a.candidate_ps[(size_t) k]);
+                }
+                for (int32_t k = 0; k < MTP_ACCEPT_DUMP_TOP_K; ++k) {
+                    mtp_accept_dump_write_scalar(target_candidate_ids[(size_t) k]);
+                }
+                for (int32_t k = 0; k < MTP_ACCEPT_DUMP_TOP_K; ++k) {
+                    mtp_accept_dump_write_scalar(target_candidate_ps[(size_t) k]);
                 }
                 mtp_accept_dump_write_scalar(a.h_scale);
                 mtp_accept_dump.write(reinterpret_cast<const char *>(a.h_q8.data()), a.h_q8.size());
@@ -2997,7 +3023,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 has_draft = has_draft || row.row_type == 0;
             }
             if (!has_draft) {
-                dump_mtp_accept_records(seq_id, 0, LLAMA_TOKEN_NULL);
+                dump_mtp_accept_records(seq_id, 0, LLAMA_TOKEN_NULL, nullptr);
             }
         }
 
@@ -3031,11 +3057,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, llama_token target_token, bool is_other) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, llama_token target_token, bool is_other, const std::vector<common_sampler_accept_trace> * target_trace) override {
         if (!is_other) {
             update_mtp_draft_cache(seq_id, n_accepted);
             update_adaptive_accept(seq_id, n_accepted);
-            dump_mtp_accept_records(seq_id, n_accepted, target_token);
+            dump_mtp_accept_records(seq_id, n_accepted, target_token, target_trace);
         }
 
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
@@ -3102,7 +3128,7 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, llama_token /*target_token*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, llama_token /*target_token*/, bool /*is_other*/, const std::vector<common_sampler_accept_trace> * /*target_trace*/) override {
         // noop
     }
 
@@ -3154,7 +3180,7 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, llama_token /*target_token*/, bool is_other) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, llama_token /*target_token*/, bool is_other, const std::vector<common_sampler_accept_trace> * /*target_trace*/) override {
         GGML_ASSERT((seq_id < (llama_seq_id) config.size()));
 
         if (is_other) {
@@ -3316,7 +3342,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, llama_token /*target_token*/, bool is_other) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, llama_token /*target_token*/, bool is_other, const std::vector<common_sampler_accept_trace> * /*target_trace*/) override {
         if (is_other) {
             return;
         }
@@ -3482,7 +3508,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, llama_token /*target_token*/, bool /*is_other*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, llama_token /*target_token*/, bool /*is_other*/, const std::vector<common_sampler_accept_trace> * /*target_trace*/) override {
         // noop
     }
 
@@ -3931,7 +3957,12 @@ void common_speculative_draft(common_speculative * spec) {
     }
 }
 
-void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, llama_token target_token) {
+void common_speculative_accept(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        uint16_t n_accepted,
+        llama_token target_token,
+        const std::vector<common_sampler_accept_trace> * target_trace) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     GGML_ASSERT(impl);
@@ -3952,14 +3983,14 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
-        impl->accept(seq_id, n_accepted, target_token, false);
+        impl->accept(seq_id, n_accepted, target_token, false, target_trace);
         impl->n_call_accept++;
     }
 
     // accept with the rest of the implementations, using is_other == true
     for (auto & impl_other : spec->impls) {
         if (impl_other.get() != impl) {
-            impl_other->accept(seq_id, n_accepted, target_token, true);
+            impl_other->accept(seq_id, n_accepted, target_token, true, nullptr);
         }
     }
 }

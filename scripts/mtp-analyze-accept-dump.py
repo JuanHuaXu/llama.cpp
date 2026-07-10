@@ -66,6 +66,7 @@ def open_accept_dump(path):
         or (magic == b"MTPACC3\0" and version == 3 and meta == 56)
         or (magic == b"MTPACC4\0" and version == 4 and meta == 60)
         or (magic == b"MTPACC5\0" and version == 5 and meta == 124)
+        or (magic == b"MTPACC6\0" and version == 6 and meta == 188)
     ) or fmt != 1:
         raise ValueError(f"unsupported accept dump {path}: magic={magic!r} version={version} meta={meta} fmt={fmt}")
     fields = [
@@ -79,6 +80,8 @@ def open_accept_dump(path):
         fields.append(("row_type", "<i4"))
     if version >= 5:
         fields.extend([("candidate_ids", "<i4", (8,)), ("candidate_ps", "<f4", (8,))])
+    if version >= 6:
+        fields.extend([("target_candidate_ids", "<i4", (8,)), ("target_candidate_ps", "<f4", (8,))])
     fields.extend([("scale", "<f4"), ("q", "i1", (n_embd,))])
     dtype = np.dtype(fields)
     record_size = meta + n_embd
@@ -89,6 +92,7 @@ def open_accept_dump(path):
         "has_target_token": bool(version >= 3),
         "has_row_type": bool(version >= 4),
         "candidate_top_k": 8 if version >= 5 else 0,
+        "target_candidate_top_k": 8 if version >= 6 else 0,
         "n_embd": int(n_embd),
         "record_size": int(record_size),
         "records": int(records),
@@ -167,6 +171,24 @@ def analyze_dump(path):
                 "candidate_target_rank_mean": float(target_rank[target_any].mean()) if target_any.any() else 0.0,
                 "candidate_draft_rank_mean": float(draft_rank[draft_any].mean()) if draft_any.any() else 0.0,
             })
+    if "target_candidate_ids" in rows.dtype.names and "target_token" in rows.dtype.names:
+        verified_draft = is_draft & (rows["verified"] == 1) & (rows["target_token"] >= 0)
+        if int(verified_draft.sum()):
+            cand = np.asarray(rows["target_candidate_ids"][verified_draft], dtype=np.int64)
+            target = np.asarray(rows["target_token"][verified_draft], dtype=np.int64)[:, None]
+            draft = np.asarray(rows["draft_token"][verified_draft], dtype=np.int64)[:, None]
+            target_hits = cand == target
+            draft_hits = cand == draft
+            target_any = target_hits.any(axis=1)
+            draft_any = draft_hits.any(axis=1)
+            target_rank = np.where(target_any, target_hits.argmax(axis=1) + 1, 0)
+            draft_rank = np.where(draft_any, draft_hits.argmax(axis=1) + 1, 0)
+            out.update({
+                "target_candidate_target_in_topk": float(target_any.mean()),
+                "target_candidate_draft_in_topk": float(draft_any.mean()),
+                "target_candidate_target_rank_mean": float(target_rank[target_any].mean()) if target_any.any() else 0.0,
+                "target_candidate_draft_rank_mean": float(draft_rank[draft_any].mean()) if draft_any.any() else 0.0,
+            })
     for depth in [0, 1, 2]:
         mask = (rows["depth"] == depth) & is_draft
         stop_mask = (rows["depth"] == depth) & is_stop
@@ -194,12 +216,18 @@ def analyze_dump(path):
             draft = np.asarray(rows["draft_token"][verified], dtype=np.int64)[:, None]
             out[f"depth{depth}"]["candidate_target_in_topk"] = float((cand == target).any(axis=1).mean())
             out[f"depth{depth}"]["candidate_draft_in_topk"] = float((cand == draft).any(axis=1).mean())
+        if "target_candidate_ids" in rows.dtype.names and "target_token" in rows.dtype.names and verified_count:
+            cand = np.asarray(rows["target_candidate_ids"][verified], dtype=np.int64)
+            target = np.asarray(rows["target_token"][verified], dtype=np.int64)[:, None]
+            draft = np.asarray(rows["draft_token"][verified], dtype=np.int64)[:, None]
+            out[f"depth{depth}"]["target_candidate_target_in_topk"] = float((cand == target).any(axis=1).mean())
+            out[f"depth{depth}"]["target_candidate_draft_in_topk"] = float((cand == draft).any(axis=1).mean())
     return out
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Analyze llama.cpp MTPACC2/MTPACC3/MTPACC4/MTPACC5 accept/reject dumps.")
-    ap.add_argument("dump", nargs="+", help="MTPACC2/MTPACC3/MTPACC4/MTPACC5 dump path(s)")
+    ap = argparse.ArgumentParser(description="Analyze llama.cpp MTPACC2/MTPACC3/MTPACC4/MTPACC5/MTPACC6 accept/reject dumps.")
+    ap.add_argument("dump", nargs="+", help="MTPACC2/MTPACC3/MTPACC4/MTPACC5/MTPACC6 dump path(s)")
     ap.add_argument("--perf", action="append", default=[], help="optional perf JSONL to summarize; can be repeated")
     args = ap.parse_args()
     for path in args.dump:

@@ -3839,7 +3839,8 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                std::vector<common_sampler_accept_trace> accept_trace;
+                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, &accept_trace);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3887,7 +3888,7 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1, accepted.back());
+                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1, accepted.back(), &accept_trace);
 
                 slot.spec_draft = std::move(accepted);
             }

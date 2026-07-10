@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "common.h"
+#include "sampling.h"
 
 struct common_speculative;
 
@@ -66,7 +67,12 @@ bool common_speculative_need_embd_nextn(common_speculative * spec);
 void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
-void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted, llama_token target_token);
+void common_speculative_accept(
+        common_speculative * spec,
+        llama_seq_id,
+        uint16_t n_accepted,
+        llama_token target_token,
+        const std::vector<common_sampler_accept_trace> * target_trace = nullptr);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

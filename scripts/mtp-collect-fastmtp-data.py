@@ -44,9 +44,9 @@ def dump_records(path):
         return 0
     with open(path, "rb") as f:
         magic, version, n_embd, meta, fmt, _limit = ACCEPT_HEADER.unpack(f.read(ACCEPT_HEADER.size))
-    if fmt != 1 or magic not in {b"MTPACC2\0", b"MTPACC3\0", b"MTPACC4\0", b"MTPACC5\0"}:
+    if fmt != 1 or magic not in {b"MTPACC2\0", b"MTPACC3\0", b"MTPACC4\0", b"MTPACC5\0", b"MTPACC6\0"}:
         return 0
-    expected_meta = {2: 52, 3: 56, 4: 60, 5: 124}.get(version)
+    expected_meta = {2: 52, 3: 56, 4: 60, 5: 124, 6: 188}.get(version)
     if expected_meta != meta:
         return 0
     return (size - ACCEPT_HEADER.size) // (meta + n_embd)
