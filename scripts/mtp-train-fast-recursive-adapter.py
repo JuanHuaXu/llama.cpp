@@ -543,7 +543,16 @@ def target_frontier_chain_weights(accept_records, idx, bonus, power):
     return weights
 
 
-def build_candidate_frontier_indices(accept_records, corr_targets, token_to_local, runtime_depth, candidate_rank_max):
+def depth_selection_mask(accept_records, runtime_depth, depth_mode):
+    depth = np.asarray(accept_records["depth"], dtype=np.int32)
+    if depth_mode == "last":
+        return depth == (runtime_depth - 1)
+    if depth_mode == "all":
+        return (depth >= 0) & (depth < runtime_depth)
+    raise ValueError(f"unsupported depth mode: {depth_mode}")
+
+
+def build_candidate_frontier_indices(accept_records, corr_targets, token_to_local, runtime_depth, candidate_rank_max, depth_mode):
     if accept_records is None or "candidate_ids" not in accept_records.dtype.names:
         return np.array([], dtype=np.int64)
 
@@ -552,7 +561,7 @@ def build_candidate_frontier_indices(accept_records, corr_targets, token_to_loca
     valid_draft = (toks >= 0) & (toks < len(token_to_local))
     draft_local[valid_draft] = token_to_local[toks[valid_draft]]
     row_type_mask = accept_records["row_type"] == 0 if "row_type" in accept_records.dtype.names else np.ones(len(accept_records), dtype=bool)
-    depth_mask = accept_records["depth"] == (runtime_depth - 1)
+    depth_mask = depth_selection_mask(accept_records, runtime_depth, depth_mode)
     verified_reject = (accept_records["verified"] == 1) & (accept_records["accepted"] == 0)
     target = np.asarray(accept_records["target_token"], dtype=np.int64)
     candidate_hits = np.asarray(accept_records["candidate_ids"], dtype=np.int64) == target[:, None]
@@ -563,7 +572,7 @@ def build_candidate_frontier_indices(accept_records, corr_targets, token_to_loca
     return np.nonzero(row_type_mask & depth_mask & verified_reject & target_in_frontier & (corr_targets >= 0) & (draft_local >= 0))[0]
 
 
-def build_accepted_frontier_preserve(accept_records, token_to_local, runtime_depth):
+def build_accepted_frontier_preserve(accept_records, token_to_local, runtime_depth, depth_mode):
     targets = np.array([], dtype=np.int64)
     if accept_records is None or "candidate_ids" not in accept_records.dtype.names:
         return np.array([], dtype=np.int64), targets
@@ -585,13 +594,13 @@ def build_accepted_frontier_preserve(accept_records, token_to_local, runtime_dep
         targets[take] = local[take]
 
     row_type_mask = accept_records["row_type"] == 0 if "row_type" in accept_records.dtype.names else np.ones(n, dtype=bool)
-    depth_mask = accept_records["depth"] == (runtime_depth - 1)
+    depth_mask = depth_selection_mask(accept_records, runtime_depth, depth_mode)
     accepted = (accept_records["verified"] == 1) & (accept_records["accepted"] == 1)
     idx = np.nonzero(row_type_mask & depth_mask & accepted & (draft_local >= 0) & (targets >= 0))[0]
     return idx, targets
 
 
-def build_target_frontier_indices(accept_records, token_to_local, runtime_depth):
+def build_target_frontier_indices(accept_records, token_to_local, runtime_depth, depth_mode):
     empty_idx = np.array([], dtype=np.int64)
     empty_candidates = np.empty((0, 8), dtype=np.int64)
     empty_ps = np.empty((0, 8), dtype=np.float32)
@@ -607,14 +616,14 @@ def build_target_frontier_indices(accept_records, token_to_local, runtime_depth)
     valid_local = local >= 0
 
     row_type_mask = accept_records["row_type"] == 0 if "row_type" in accept_records.dtype.names else np.ones(n, dtype=bool)
-    depth_mask = accept_records["depth"] == (runtime_depth - 1)
+    depth_mask = depth_selection_mask(accept_records, runtime_depth, depth_mode)
     verified = accept_records["verified"] == 1
     has_mass = ((ps > 0.0) & valid_local).any(axis=1)
     idx = np.nonzero(row_type_mask & depth_mask & verified & has_mass)[0]
     return idx, local, ps
 
 
-def build_indices(static_records, accept_records, label, runtime_depth, token_to_local, chain_bonus=0.0, chain_power=0.0, chain_utility_bonus=0.0, chain_utility_power=0.0, reject_utility_bonus=0.0, reject_utility_power=0.0, target_utility_bonus=0.0, target_utility_power=0.0, candidate_rank_max=0):
+def build_indices(static_records, accept_records, label, runtime_depth, token_to_local, depth_mode="last", chain_bonus=0.0, chain_power=0.0, chain_utility_bonus=0.0, chain_utility_power=0.0, reject_utility_bonus=0.0, reject_utility_power=0.0, target_utility_bonus=0.0, target_utility_power=0.0, candidate_rank_max=0):
     static_idx = np.array([], dtype=np.int64)
     pos_idx = np.array([], dtype=np.int64)
     neg_idx = np.array([], dtype=np.int64)
@@ -633,7 +642,7 @@ def build_indices(static_records, accept_records, label, runtime_depth, token_to
         toks = np.asarray(accept_records["draft_token"], dtype=np.int64)
         in_vocab = (toks >= 0) & (toks < len(token_to_local)) & (token_to_local[toks] >= 0)
         row_type_mask = accept_records["row_type"] == 0 if "row_type" in accept_records.dtype.names else np.ones(len(accept_records), dtype=bool)
-        depth_mask = accept_records["depth"] == (runtime_depth - 1)
+        depth_mask = depth_selection_mask(accept_records, runtime_depth, depth_mode)
         verified = accept_records["verified"] == 1
         pos_idx = np.nonzero(row_type_mask & depth_mask & verified & (accept_records["accepted"] == 1) & in_vocab)[0]
         neg_idx = np.nonzero(row_type_mask & depth_mask & verified & (accept_records["accepted"] == 0) & in_vocab)[0]
@@ -641,9 +650,9 @@ def build_indices(static_records, accept_records, label, runtime_depth, token_to
         valid_draft = (toks >= 0) & (toks < len(token_to_local))
         draft_local[valid_draft] = token_to_local[toks[valid_draft]]
         corr_idx = np.nonzero(row_type_mask & depth_mask & verified & (accept_records["accepted"] == 0) & (corr_targets >= 0) & (draft_local >= 0))[0]
-        candidate_idx = build_candidate_frontier_indices(accept_records, corr_targets, token_to_local, runtime_depth, candidate_rank_max)
-        preserve_idx, preserve_targets = build_accepted_frontier_preserve(accept_records, token_to_local, runtime_depth)
-        target_frontier_idx, target_frontier_candidates, target_frontier_ps = build_target_frontier_indices(accept_records, token_to_local, runtime_depth)
+        candidate_idx = build_candidate_frontier_indices(accept_records, corr_targets, token_to_local, runtime_depth, candidate_rank_max, depth_mode)
+        preserve_idx, preserve_targets = build_accepted_frontier_preserve(accept_records, token_to_local, runtime_depth, depth_mode)
+        target_frontier_idx, target_frontier_candidates, target_frontier_ps = build_target_frontier_indices(accept_records, token_to_local, runtime_depth, depth_mode)
     pos_weights = accepted_chain_weights(accept_records, pos_idx, runtime_depth, chain_bonus, chain_power, chain_utility_bonus, chain_utility_power) if accept_records is not None else None
     corr_weights = rejected_chain_weights(accept_records, corr_idx, reject_utility_bonus, reject_utility_power) if accept_records is not None else None
     candidate_weights = rejected_chain_weights(accept_records, candidate_idx, reject_utility_bonus, reject_utility_power) if accept_records is not None else None
@@ -729,6 +738,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--init-adapter", default="")
     ap.add_argument("--runtime-depth", type=int, choices=[1, 2, 3], required=True)
+    ap.add_argument("--train-depth-mode", choices=["last", "all"], default="last", help="accept-dump depths to train on; all covers every verified depth below runtime-depth")
     ap.add_argument("--rank", type=int, default=128)
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--steps", type=int, default=2000)
@@ -820,6 +830,7 @@ def main():
         label,
         args.runtime_depth,
         token_to_local,
+        args.train_depth_mode,
         args.accepted_chain_bonus,
         args.accepted_chain_power,
         args.accepted_chain_utility_bonus,

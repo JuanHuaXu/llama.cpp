@@ -26,12 +26,19 @@ def parse_adapter(value):
     return Path(path).stem, path
 
 
-def row_mask(records, token_to_local, depth):
+def row_mask(records, token_to_local, runtime_depth, depth_mode):
     target = np.asarray(records["target_token"], dtype=np.int64)
     draft = np.asarray(records["draft_token"], dtype=np.int64)
     target_ok = (target >= 0) & (target < len(token_to_local)) & (token_to_local[target] >= 0)
     draft_ok = (draft >= 0) & (draft < len(token_to_local)) & (token_to_local[draft] >= 0)
-    mask = (records["depth"] == depth) & (records["verified"] == 1) & target_ok & draft_ok
+    depth = np.asarray(records["depth"], dtype=np.int32)
+    if depth_mode == "last":
+        depth_ok = depth == (runtime_depth - 1)
+    elif depth_mode == "all":
+        depth_ok = (depth >= 0) & (depth < runtime_depth)
+    else:
+        raise ValueError(f"unsupported depth mode: {depth_mode}")
+    mask = depth_ok & (records["verified"] == 1) & target_ok & draft_ok
     if "row_type" in records.dtype.names:
         mask = mask & (records["row_type"] == 0)
     return mask
@@ -142,6 +149,7 @@ def main():
     ap.add_argument("--output-cache", default="")
     ap.add_argument("--fr-vocab", default="")
     ap.add_argument("--runtime-depth", type=int, choices=[1, 2, 3], required=True)
+    ap.add_argument("--depth-mode", choices=["last", "all"], default="last")
     ap.add_argument("--adapter", action="append", default=[], help="name=checkpoint.pt; repeatable. The implicit base model is always evaluated first.")
     ap.add_argument("--rank", type=int, default=128)
     ap.add_argument("--batch-size", type=int, default=256)
@@ -165,7 +173,7 @@ def main():
     output_weight = full_output_weight[torch.from_numpy(fr_ids).to(device=device)]
     norm_weight = train_mod.load_norm_weight(reader, header["n_embd"], device)
 
-    idx = np.nonzero(row_mask(records, token_to_local, args.runtime_depth - 1))[0]
+    idx = np.nonzero(row_mask(records, token_to_local, args.runtime_depth, args.depth_mode))[0]
     if args.max_rows > 0 and len(idx) > args.max_rows:
         rng = np.random.default_rng(args.seed)
         idx = np.sort(rng.choice(idx, size=args.max_rows, replace=False))
@@ -174,7 +182,8 @@ def main():
         "event": "start",
         "accept_dump": args.accept_dump,
         "runtime_depth": args.runtime_depth,
-        "depth": args.runtime_depth - 1,
+        "depth_mode": args.depth_mode,
+        "depth": args.runtime_depth - 1 if args.depth_mode == "last" else f"0..{args.runtime_depth - 1}",
         "rows": int(len(idx)),
         "fr_vocab": int(len(fr_ids)),
         "records": int(header["records"]),
