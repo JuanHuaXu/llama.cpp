@@ -44,6 +44,7 @@ def read_accept_header(path):
         (magic == b"MTPACC2\0" and version == 2 and meta == 52)
         or (magic == b"MTPACC3\0" and version == 3 and meta == 56)
         or (magic == b"MTPACC4\0" and version == 4 and meta == 60)
+        or (magic == b"MTPACC5\0" and version == 5 and meta == 124)
     ) or fmt != 1:
         raise ValueError(f"unsupported accept dump: magic={magic!r} version={version} fmt={fmt} meta={meta}")
     records = (os.path.getsize(path) - 32) // (meta + n_embd)
@@ -60,6 +61,8 @@ def open_accept(path, header):
         fields.append(("target_token", "<i4"))
     if header["version"] >= 4:
         fields.append(("row_type", "<i4"))
+    if header["version"] >= 5:
+        fields.extend([("candidate_ids", "<i4", (8,)), ("candidate_ps", "<f4", (8,))])
     fields.extend([("scale", "<f4"), ("q", "i1", (header["n_embd"],))])
     dtype = np.dtype(fields)
     return np.memmap(path, mode="r", dtype=dtype, offset=32, shape=(header["records"],))

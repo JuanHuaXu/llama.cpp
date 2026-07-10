@@ -1247,6 +1247,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         uint32_t samples       = 0;
     };
 
+    static constexpr int32_t MTP_ACCEPT_DUMP_TOP_K = 8;
+
     struct mtp_accept_attempt {
         llama_pos   pos         = 0;
         llama_token prev_token  = 0;
@@ -1256,6 +1258,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         float       p           = 0.0f;
         float       h_in_scale  = 1.0f;
         float       h_scale     = 1.0f;
+        std::array<int32_t, MTP_ACCEPT_DUMP_TOP_K> candidate_ids = {};
+        std::array<float,   MTP_ACCEPT_DUMP_TOP_K> candidate_ps  = {};
         std::vector<int8_t> h_in_q8;
         std::vector<int8_t> h_q8;
     };
@@ -2116,7 +2120,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     static constexpr uint32_t mtp_accept_dump_header_bytes = 32;
-    static constexpr uint32_t mtp_accept_dump_meta_bytes = 60;
+    static constexpr uint32_t mtp_accept_dump_meta_bytes = 124;
     static constexpr uint32_t mtp_accept_dump_format_q8_row_scale = 1;
     static constexpr uint32_t mtp_state_dump_meta_bytes = 56;
     static constexpr uint32_t mtp_state_dump_format_q8_pair_scale = 1;
@@ -2226,8 +2230,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        const char magic[8] = { 'M', 'T', 'P', 'A', 'C', 'C', '4', '\0' };
-        const uint32_t version = 4;
+        const char magic[8] = { 'M', 'T', 'P', 'A', 'C', 'C', '5', '\0' };
+        const uint32_t version = 5;
 
         if (params.mtp_accept_dump_append && init_mtp_accept_dump_append(magic, version)) {
             return;
@@ -2336,6 +2340,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    void fill_mtp_accept_candidates(mtp_accept_attempt & attempt, const llama_token_data_array * candidates) const {
+        attempt.candidate_ids.fill((int32_t) LLAMA_TOKEN_NULL);
+        attempt.candidate_ps.fill(0.0f);
+        if (candidates == nullptr) {
+            return;
+        }
+
+        const int32_t n = std::min<int32_t>(MTP_ACCEPT_DUMP_TOP_K, (int32_t) candidates->size);
+        for (int32_t i = 0; i < n; ++i) {
+            attempt.candidate_ids[(size_t) i] = (int32_t) candidates->data[i].id;
+            attempt.candidate_ps[(size_t) i] = std::isfinite(candidates->data[i].p) ? candidates->data[i].p : 0.0f;
+        }
+    }
+
     void add_mtp_accept_attempt(
             llama_seq_id seq_id,
             llama_pos pos,
@@ -2345,6 +2363,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             float p,
             const float * h_in,
             const float * h,
+            const llama_token_data_array * candidates,
             int32_t row_type = 0) {
         if (((!mtp_accept_dump.is_open() || mtp_accept_dump_finished) &&
                     (!mtp_state_dump.is_open() || mtp_state_dump_finished)) || h == nullptr ||
@@ -2359,6 +2378,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         attempt.depth = depth;
         attempt.row_type = row_type;
         attempt.p = p;
+        fill_mtp_accept_candidates(attempt, candidates);
         attempt.h_in_scale = quantize_hidden_row_q8(h_in, attempt.h_in_q8);
         attempt.h_scale = quantize_hidden_row_q8(h, attempt.h_q8);
 
@@ -2407,6 +2427,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 mtp_accept_dump_write_scalar(n_drafted);
                 mtp_accept_dump_write_scalar(row_target);
                 mtp_accept_dump_write_scalar(a.row_type);
+                for (int32_t k = 0; k < MTP_ACCEPT_DUMP_TOP_K; ++k) {
+                    mtp_accept_dump_write_scalar(a.candidate_ids[(size_t) k]);
+                }
+                for (int32_t k = 0; k < MTP_ACCEPT_DUMP_TOP_K; ++k) {
+                    mtp_accept_dump_write_scalar(a.candidate_ps[(size_t) k]);
+                }
                 mtp_accept_dump_write_scalar(a.h_scale);
                 mtp_accept_dump.write(reinterpret_cast<const char *>(a.h_q8.data()), a.h_q8.size());
 
@@ -2902,7 +2928,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     const float * h_in = seq_id >= 0 && seq_id < (llama_seq_id) mtp_draft_input_h.size()
                         ? mtp_draft_input_h[seq_id].data()
                         : nullptr;
-                    add_mtp_accept_attempt(seq_id, dp.n_past + (llama_pos) dp.result->size() + 1, prev_token, top_id, i, top_p, h_in, h_row, 1);
+                    add_mtp_accept_attempt(seq_id, dp.n_past + (llama_pos) dp.result->size() + 1, prev_token, top_id, i, top_p, h_in, h_row, cur_p, 1);
 
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -2915,7 +2941,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const float * h_in = seq_id >= 0 && seq_id < (llama_seq_id) mtp_draft_input_h.size()
                     ? mtp_draft_input_h[seq_id].data()
                     : nullptr;
-                add_mtp_accept_attempt(seq_id, dp.n_past + (llama_pos) result.size() + 1, prev_token, id, i, p_draft, h_in, h_row);
+                add_mtp_accept_attempt(seq_id, dp.n_past + (llama_pos) result.size() + 1, prev_token, id, i, p_draft, h_in, h_row, cur_p);
 
                 common_sampler_accept(smpl, id, true);
 
