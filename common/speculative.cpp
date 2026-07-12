@@ -1457,6 +1457,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
+        bool mtp_backend_sampling_ready = this->params.backend_sampling;
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -1471,6 +1472,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
                     llama_sampler_free(chain);
                     chain = nullptr;
+                    mtp_backend_sampling_ready = false;
                 }
                 backend_chains[seq_id] = chain;
             }
@@ -1482,7 +1484,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (this->params.mtp_backend_greedy) {
             SPC_INF("%s", "MTP backend greedy sampling enabled; draft p-min stopping is bypassed\n");
         }
-        if (!mtp_fr_allowed.empty() && this->params.backend_sampling) {
+        if (!mtp_fr_allowed.empty() && mtp_backend_sampling_ready) {
             llama_tokens ids;
             ids.reserve(mtp_fr_allowed.size());
             for (size_t id = 0; id < mtp_fr_allowed.size(); ++id) {
@@ -1496,6 +1498,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             llama_set_mtp_compact_vocab(ctx_dft, ids.data(), ids.size(), n_dynamic);
             SPC_INF("MTP compact vocab enabled: static=%zu dynamic=%zu\n", ids.size(), n_dynamic);
+        } else if (!mtp_fr_allowed.empty() && this->params.backend_sampling) {
+            SPC_WRN("%s", "MTP compact vocab disabled because backend sampling is unavailable; using the CPU FR filter\n");
         }
         llama_set_mtp_hidden_lora_state(ctx_dft, this->params.mtp_lora_state);
 
@@ -3451,28 +3455,57 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         ++score.samples;
     }
 
+    void append_mtp_compact_prompt_vocab(
+            const common_speculative_draft_params_vec & dparams,
+            llama_tokens & ids,
+            size_t n_dynamic) const {
+        if (!params.mtp_fr_prompt_tokens || n_dynamic == 0 || ids.size() >= n_dynamic) {
+            return;
+        }
+
+        std::vector<const llama_tokens *> prompts(dparams.size(), nullptr);
+        std::vector<size_t> begin(dparams.size(), 0);
+        std::vector<size_t> cursor(dparams.size(), 0);
+        std::unordered_set<llama_token> seen;
+        for (size_t seq_id = 0; seq_id < dparams.size(); ++seq_id) {
+            const auto & dp = dparams[seq_id];
+            if (!dp.drafting || dp.prompt == nullptr) {
+                continue;
+            }
+            const auto & prompt = *dp.prompt;
+            prompts[seq_id] = &prompt;
+            begin[seq_id] = prompt.size() > params.mtp_fr_prompt_context ? prompt.size() - params.mtp_fr_prompt_context : 0;
+            cursor[seq_id] = prompt.size();
+        }
+
+        // Interleave active prompts so one slot cannot consume the shared tail.
+        bool advanced = true;
+        while (ids.size() < n_dynamic && advanced) {
+            advanced = false;
+            for (size_t seq_id = 0; seq_id < prompts.size() && ids.size() < n_dynamic; ++seq_id) {
+                const auto * prompt = prompts[seq_id];
+                while (prompt != nullptr && cursor[seq_id] > begin[seq_id]) {
+                    advanced = true;
+                    const llama_token id = (*prompt)[--cursor[seq_id]];
+                    if (id >= 0 && (size_t) id < mtp_fr_allowed.size() &&
+                            !mtp_fr_allowed[(size_t) id] && seen.insert(id).second) {
+                        ids.push_back(id);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     void update_mtp_compact_prompt_vocab(const common_speculative_draft_params_vec & dparams) {
         if (mtp_fr_allowed.empty() || !params.mtp_fr_prompt_tokens || mtp_frontier.ready()) {
             return;
         }
 
-        llama_tokens ids;
         const size_t n_dynamic = params.mtp_fr_dynamic;
+        llama_tokens ids;
         ids.reserve(n_dynamic);
-        std::unordered_set<llama_token> seen;
-        for (const auto & dp : dparams) {
-            if (!dp.drafting || dp.prompt == nullptr) {
-                continue;
-            }
-            const auto & prompt = *dp.prompt;
-            const size_t begin = prompt.size() > params.mtp_fr_prompt_context ? prompt.size() - params.mtp_fr_prompt_context : 0;
-            for (size_t i = prompt.size(); i > begin && ids.size() < n_dynamic; --i) {
-                const llama_token id = prompt[i - 1];
-                if (id >= 0 && (size_t) id < mtp_fr_allowed.size() && !mtp_fr_allowed[(size_t) id] && seen.insert(id).second) {
-                    ids.push_back(id);
-                }
-            }
-        }
+        append_mtp_compact_prompt_vocab(dparams, ids, n_dynamic);
         while (ids.size() < n_dynamic) {
             ids.push_back(0);
         }
@@ -3510,27 +3543,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         constexpr size_t n_dynamic = 2048;
+        const size_t prompt_reserve = params.mtp_fr_prompt_tokens ? n_dynamic / 2 : 0;
         llama_tokens ids;
         ids.reserve(n_dynamic);
         std::unordered_set<llama_token> seen;
-        for (size_t id = 0; id < mtp_frontier.cluster.size() && ids.size() < n_dynamic; ++id) {
+        for (size_t id = 0; id < mtp_frontier.cluster.size() && ids.size() < n_dynamic - prompt_reserve; ++id) {
             if (mtp_frontier.cluster[id] == (int32_t) selected_cluster && !mtp_fr_allowed[id] && seen.insert((llama_token) id).second) {
                 ids.push_back((llama_token) id);
             }
         }
-        if (params.mtp_fr_prompt_tokens) {
-            for (const auto & dp : dparams) {
-                if (!dp.drafting || dp.prompt == nullptr) {
-                    continue;
-                }
-                const auto & prompt = *dp.prompt;
-                const size_t begin = prompt.size() > params.mtp_fr_prompt_context ? prompt.size() - params.mtp_fr_prompt_context : 0;
-                for (size_t i = prompt.size(); i > begin && ids.size() < n_dynamic; --i) {
-                    const llama_token id = prompt[i - 1];
-                    if (id >= 0 && (size_t) id < mtp_fr_allowed.size() && !mtp_fr_allowed[(size_t) id] && seen.insert(id).second) {
-                        ids.push_back(id);
-                    }
-                }
+        append_mtp_compact_prompt_vocab(dparams, ids, n_dynamic);
+        for (size_t id = 0; id < mtp_frontier.cluster.size() && ids.size() < n_dynamic; ++id) {
+            if (mtp_frontier.cluster[id] == (int32_t) selected_cluster && !mtp_fr_allowed[id] && seen.insert((llama_token) id).second) {
+                ids.push_back((llama_token) id);
             }
         }
         while (ids.size() < n_dynamic) {
