@@ -1160,6 +1160,15 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_mtp_recursive_depth(uint32_t depth) {
+    if (cparams.mtp_recursive_depth == depth) {
+        return;
+    }
+
+    cparams.mtp_recursive_depth = depth;
+    sched_need_reserve = true;
+}
+
 void llama_context::set_mtp_hidden_lora(llama_adapter_lora * adapter, float scale) {
     llama_adapter_lora_weight * weight = adapter ? adapter->get_mtp_hidden() : nullptr;
     if (mtp_hidden_lora == weight && mtp_hidden_lora_scale == scale) {
@@ -1186,6 +1195,93 @@ void llama_context::set_mtp_hidden_lora_state(bool value) {
     }
 
     mtp_hidden_lora_state = value;
+}
+
+void llama_context::set_mtp_compact_vocab(const llama_token * ids, size_t n_ids, size_t n_dynamic) {
+    mtp_compact_head = nullptr;
+    mtp_compact_vocab = nullptr;
+    mtp_compact_buf.reset();
+    mtp_compact_ctx.reset();
+    mtp_compact_source.clear();
+    mtp_compact_static_rows = 0;
+    mtp_compact_dynamic_rows = 0;
+    mtp_compact_row_size = 0;
+
+    if (n_ids == 0) {
+        sched_need_reserve = true;
+        return;
+    }
+
+    GGML_ASSERT(ids != nullptr);
+    GGML_ASSERT(cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
+
+    ggml_tensor * source = model.output;
+    GGML_ASSERT(source != nullptr);
+
+    const int64_t n_embd = source->ne[0];
+    const int64_t n_vocab = source->ne[1];
+    const size_t row_size = ggml_row_size(source->type, n_embd);
+
+    mtp_compact_source.resize(ggml_nbytes(source));
+    ggml_backend_tensor_get(source, mtp_compact_source.data(), 0, mtp_compact_source.size());
+
+    const size_t n_total = n_ids + n_dynamic;
+    std::vector<uint8_t> compact_data(n_total * row_size);
+    std::vector<llama_token> compact_ids(n_total, 0);
+    for (size_t i = 0; i < n_ids; ++i) {
+        GGML_ASSERT(ids[i] >= 0 && ids[i] < n_vocab);
+        compact_ids[i] = ids[i];
+        std::memcpy(compact_data.data() + i * row_size,
+                    mtp_compact_source.data() + (size_t) ids[i] * row_size,
+                    row_size);
+    }
+    for (size_t i = n_ids; i < n_total; ++i) {
+        std::memcpy(compact_data.data() + i * row_size, mtp_compact_source.data(), row_size);
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    mtp_compact_ctx.reset(ggml_init(params));
+
+    mtp_compact_head = ggml_new_tensor_2d(mtp_compact_ctx.get(), source->type, n_embd, n_total);
+    mtp_compact_vocab = ggml_new_tensor_1d(mtp_compact_ctx.get(), GGML_TYPE_I32, n_total);
+
+    const auto buft = ggml_backend_buffer_get_type(source->buffer);
+    mtp_compact_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mtp_compact_ctx.get(), buft));
+    GGML_ASSERT(mtp_compact_buf);
+
+    ggml_backend_tensor_set(mtp_compact_head, compact_data.data(), 0, compact_data.size());
+    ggml_backend_tensor_set(mtp_compact_vocab, compact_ids.data(), 0, compact_ids.size() * sizeof(*ids));
+
+    mtp_compact_static_rows = n_ids;
+    mtp_compact_dynamic_rows = n_dynamic;
+    mtp_compact_row_size = row_size;
+
+    sched_need_reserve = true;
+}
+
+void llama_context::update_mtp_compact_vocab(const llama_token * ids, size_t n_ids) {
+    if (mtp_compact_dynamic_rows == 0 || n_ids == 0) {
+        return;
+    }
+
+    GGML_ASSERT(mtp_compact_head && mtp_compact_vocab);
+    GGML_ASSERT(n_ids <= mtp_compact_dynamic_rows);
+
+    std::vector<uint8_t> rows(n_ids * mtp_compact_row_size);
+    for (size_t i = 0; i < n_ids; ++i) {
+        GGML_ASSERT(ids[i] >= 0 && (size_t) ids[i] * mtp_compact_row_size < mtp_compact_source.size());
+        std::memcpy(rows.data() + i * mtp_compact_row_size,
+                    mtp_compact_source.data() + (size_t) ids[i] * mtp_compact_row_size,
+                    mtp_compact_row_size);
+    }
+
+    const size_t row_offset = mtp_compact_static_rows * mtp_compact_row_size;
+    ggml_backend_tensor_set(mtp_compact_head, rows.data(), row_offset, rows.size());
+    ggml_backend_tensor_set(mtp_compact_vocab, ids, mtp_compact_static_rows * sizeof(*ids), n_ids * sizeof(*ids));
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -2449,6 +2545,8 @@ llm_graph_params llama_context::graph_params(
         /*.mctx                  =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
+        /*.mtp_compact_head =*/ mtp_compact_head,
+        /*.mtp_compact_vocab =*/ mtp_compact_vocab,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3744,6 +3842,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
 }
 
+void llama_set_mtp_recursive_depth(llama_context * ctx, uint32_t depth) {
+    ctx->set_mtp_recursive_depth(depth);
+}
+
 void llama_set_mtp_hidden_lora(llama_context * ctx, llama_adapter_lora * adapter, float scale) {
     ctx->set_mtp_hidden_lora(adapter, scale);
 }
@@ -3754,6 +3856,14 @@ void llama_set_mtp_hidden_state_lora(llama_context * ctx, llama_adapter_lora * a
 
 void llama_set_mtp_hidden_lora_state(llama_context * ctx, bool value) {
     ctx->set_mtp_hidden_lora_state(value);
+}
+
+void llama_set_mtp_compact_vocab(llama_context * ctx, const llama_token * ids, size_t n_ids, size_t n_dynamic) {
+    ctx->set_mtp_compact_vocab(ids, n_ids, n_dynamic);
+}
+
+void llama_update_mtp_compact_vocab(llama_context * ctx, const llama_token * ids, size_t n_ids) {
+    ctx->update_mtp_compact_vocab(ids, n_ids);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

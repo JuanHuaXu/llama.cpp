@@ -3732,6 +3732,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-mtp-backend-greedy"},
+        {"--no-spec-mtp-backend-greedy"},
+        string_format("use GPU argmax directly for draft-MTP tokens; bypasses draft probability stopping (default: %s)",
+                      params.speculative.draft.mtp_backend_greedy ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.mtp_backend_greedy = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_BACKEND_GREEDY"));
+    add_opt(common_arg(
+        {"--spec-mtp-profile"},
+        {"--no-spec-mtp-profile"},
+        string_format("report draft-MTP decode and host-boundary timings (default: %s)",
+                      params.speculative.draft.mtp_profile ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.mtp_profile = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_PROFILE"));
+    add_opt(common_arg(
         {"--spec-mtp-dump"}, "FNAME",
         "write draft-MTP training records to this file (q8 hidden rows + 3 next-token labels)",
         [](common_params & params, const std::string & value) {
@@ -3764,6 +3782,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mtp_train_dump_source = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_DUMP_SOURCE"));
+    add_opt(common_arg(
+        {"--spec-mtp-teacher-dump"}, "FNAME",
+        "write target-model Top-K logits aligned one-for-one with --spec-mtp-dump records",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_train_teacher_dump = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_TEACHER_DUMP"));
+    add_opt(common_arg(
+        {"--spec-mtp-teacher-top-k"}, "N",
+        "number of target-model logits to retain per --spec-mtp-dump record (default: 0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            const int32_t top_k = std::stoi(value);
+            if (top_k < 0 || top_k > 1024) {
+                throw std::invalid_argument("--spec-mtp-teacher-top-k must be in [0, 1024]");
+            }
+            params.speculative.draft.mtp_train_teacher_top_k = top_k;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_TEACHER_TOP_K"));
     add_opt(common_arg(
         {"--spec-mtp-accept-dump"}, "FNAME",
         "path to write draft-MTP accept/reject records for rejection-aware training",
@@ -3990,6 +4026,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_LOGIT_BIAS"));
     add_opt(common_arg(
+        {"--spec-mtp-candidate-reranker"}, "FNAME",
+        "hidden-conditioned low-rank reranker for the first 8 draft-MTP candidates",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_candidate_reranker = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_CANDIDATE_RERANKER"));
+    add_opt(common_arg(
+        {"--spec-mtp-candidate-reranker-scale"}, "P",
+        "correction scale for --spec-mtp-candidate-reranker (default: 1.0)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_candidate_reranker_scale = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_CANDIDATE_RERANKER_SCALE"));
+    add_opt(common_arg(
         {"--spec-mtp-target-accept-top-k"}, "N",
         "accept draft-MTP tokens that appear in the target sampler top-k instead of requiring exact sampled-token match (0 = disabled)",
         [](common_params & params, const std::string & value) {
@@ -4010,6 +4060,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mtp_fr_vocab = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_FR_VOCAB"));
+    add_opt(common_arg(
+        {"--spec-mtp-frontier-selector"}, "FNAME",
+        "context-conditioned compact vocabulary frontier for draft-MTP (requires --spec-mtp-fr-vocab)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_frontier_selector = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_FRONTIER_SELECTOR"));
     add_opt(common_arg(
         {"--spec-mtp-fr-top-k"}, "N",
         "number of draft-MTP sampler candidates to scan when --spec-mtp-fr-vocab is set (default: 256)",
@@ -4033,6 +4090,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mtp_fr_prompt_context = std::stoul(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_FR_PROMPT_CONTEXT"));
+    add_opt(common_arg(
+        {"--spec-mtp-fr-dynamic"}, "N",
+        "compact output rows reserved for recent draft-MTP prompt tokens (default: 512)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_fr_dynamic = std::stoul(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_FR_DYNAMIC"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"

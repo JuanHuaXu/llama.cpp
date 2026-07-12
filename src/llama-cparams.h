@@ -19,6 +19,7 @@ struct llama_cparams {
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
     int32_t  nextn_layer_offset = 0;
+    uint32_t mtp_recursive_depth = 0; // unroll fixed-depth MTP drafting inside one graph
 
     float rope_freq_base;
     float rope_freq_scale;

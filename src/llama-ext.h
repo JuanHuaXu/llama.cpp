@@ -100,6 +100,10 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// Unroll a fixed number of MTP draft positions in one decoder graph. A value
+// of zero preserves the serial MTP graph.
+LLAMA_API void llama_set_mtp_recursive_depth(struct llama_context * ctx, uint32_t depth);
+
 // Select a draft-only hidden-state adapter for the active NextN/MTP head.
 // This bypasses regular LoRA graph plumbing so only the MTP hidden row is adjusted.
 LLAMA_API void llama_set_mtp_hidden_lora(struct llama_context * ctx, struct llama_adapter_lora * adapter, float scale);
@@ -111,6 +115,10 @@ LLAMA_API void llama_set_mtp_hidden_state_lora(struct llama_context * ctx, struc
 // Apply the MTP hidden adapter before h_nextn is exported, so recursive MTP
 // drafting consumes the adapted state. Default false keeps legacy logits-only use.
 LLAMA_API void llama_set_mtp_hidden_lora_state(struct llama_context * ctx, bool value);
+
+// Copy selected rows from the MTP output head into a contiguous device tensor.
+LLAMA_API void llama_set_mtp_compact_vocab(struct llama_context * ctx, const llama_token * ids, size_t n_ids, size_t n_dynamic);
+LLAMA_API void llama_update_mtp_compact_vocab(struct llama_context * ctx, const llama_token * ids, size_t n_ids);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);

@@ -329,11 +329,15 @@ struct common_params_speculative_draft {
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+    bool mtp_backend_greedy = false; // use GPU argmax directly for MTP draft tokens
+    bool mtp_profile = false; // report draft-MTP decode and host-boundary time
 
     std::string mtp_train_dump; // path to write draft-MTP training records
     std::string mtp_train_dump_source = "target"; // source hidden rows: target or draft
     uint64_t mtp_train_dump_limit = 0; // maximum records to dump (0 = unlimited)
     bool mtp_train_dump_append = false; // append to an existing compatible dump instead of truncating
+    std::string mtp_train_teacher_dump; // aligned target-logit Top-K sidecar for MTP-D training
+    int32_t mtp_train_teacher_top_k = 0; // Top-K target logits per static training record (0 = disabled)
 
     std::string mtp_accept_dump; // path to write draft-MTP accept/reject records
     uint64_t mtp_accept_dump_limit = 0; // maximum accept/reject records to dump (0 = unlimited)
@@ -362,14 +366,18 @@ struct common_params_speculative_draft {
     std::string mtp_state_head; // optional direct-state head used to steer draft-MTP hidden rows
     float mtp_state_head_scale = 1.0f; // blend factor for direct-state hidden steering
     std::string mtp_logit_bias; // optional draft-only token logit bias file
+    std::string mtp_candidate_reranker; // optional hidden-conditioned reranker for the draft top-k frontier
+    float mtp_candidate_reranker_scale = 1.0f; // correction scale for the MTP candidate reranker
 
     int32_t mtp_target_accept_top_k = 0; // accept a draft token if target ranks it within this top-k (0 = strict sampled-token match)
     float mtp_target_accept_p_min = 0.0f; // minimum target probability for --spec-mtp-target-accept-top-k
 
     std::string mtp_fr_vocab; // optional frequency-ranked token allowlist for MTP drafting
+    std::string mtp_frontier_selector; // optional context-conditioned compact MTP vocabulary tail
     uint32_t mtp_fr_top_k = 256; // sampler candidates scanned when the allowlist is active
     bool mtp_fr_prompt_tokens = true; // also allow recent prompt/generated tokens outside the allowlist
     uint32_t mtp_fr_prompt_context = 2048; // recent prompt tokens scanned for allowlist extension
+    uint32_t mtp_fr_dynamic = 512; // compact output rows reserved for prompt tokens outside the allowlist
 
     common_params_model mparams;
 

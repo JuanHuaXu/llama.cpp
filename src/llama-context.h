@@ -116,9 +116,12 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_mtp_recursive_depth(uint32_t depth);
     void set_mtp_hidden_lora(llama_adapter_lora * adapter, float scale);
     void set_mtp_hidden_state_lora(llama_adapter_lora * adapter, float scale);
     void set_mtp_hidden_lora_state(bool value);
+    void set_mtp_compact_vocab(const llama_token * ids, size_t n_ids, size_t n_dynamic);
+    void update_mtp_compact_vocab(const llama_token * ids, size_t n_ids);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -287,6 +290,15 @@ private:
     float mtp_hidden_lora_scale = 1.0f;
     float mtp_hidden_state_lora_scale = 1.0f;
     bool mtp_hidden_lora_state = false;
+
+    ggml_context_ptr mtp_compact_ctx;
+    ggml_backend_buffer_ptr mtp_compact_buf;
+    ggml_tensor * mtp_compact_head = nullptr;
+    ggml_tensor * mtp_compact_vocab = nullptr;
+    std::vector<uint8_t> mtp_compact_source;
+    size_t mtp_compact_static_rows = 0;
+    size_t mtp_compact_dynamic_rows = 0;
+    size_t mtp_compact_row_size = 0;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

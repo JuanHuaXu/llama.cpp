@@ -684,6 +684,8 @@ struct llm_graph_params {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    ggml_tensor * mtp_compact_head;
+    ggml_tensor * mtp_compact_vocab;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -766,6 +768,9 @@ struct llm_graph_params {
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
             return false;
         }
+        if (cparams.mtp_recursive_depth != other.cparams.mtp_recursive_depth) {
+            return false;
+        }
 
         return
             cparams.embeddings              == other.cparams.embeddings              &&
@@ -781,6 +786,8 @@ struct llm_graph_params {
             mtp_hidden_lora_scale == other.mtp_hidden_lora_scale &&
             mtp_hidden_state_lora_scale == other.mtp_hidden_state_lora_scale &&
             mtp_hidden_lora_state == other.mtp_hidden_lora_state &&
+            mtp_compact_head == other.mtp_compact_head &&
+            mtp_compact_vocab == other.mtp_compact_vocab &&
             cross == other.cross;
     }
 };
@@ -796,6 +803,7 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_mtp_recursive_tokens() const { return t_mtp_recursive_tokens; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -827,6 +835,8 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_mtp_recursive_tokens = nullptr; // I32 [mtp_recursive_depth]
+    ggml_tensor * t_mtp_compact_vocab = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -923,6 +933,8 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    ggml_tensor * mtp_compact_head;
+    ggml_tensor * mtp_compact_vocab;
 
     const llm_graph_cb & cb_func;
 

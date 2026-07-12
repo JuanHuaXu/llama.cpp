@@ -23,6 +23,7 @@
 #include <cinttypes>
 #include <unordered_map>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -188,6 +189,7 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1305,7 +1307,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int32_t> active_cap;
     std::vector<int64_t> active_start_us;
     std::fstream mtp_dump;
+    std::fstream mtp_teacher_dump;
     std::vector<int8_t> mtp_dump_q8;
+    std::vector<llama_token_data> mtp_teacher_candidates;
     std::fstream mtp_accept_dump;
     std::fstream mtp_state_dump;
     std::vector<std::vector<mtp_accept_attempt>> mtp_accept_pending;
@@ -1351,6 +1355,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     uint64_t mtp_dump_records  = 0;
     bool     mtp_dump_finished = false;
+    bool     mtp_teacher_dump_finished = false;
     uint32_t accept_updates      = 0;
     int32_t  n_max_adaptive_last = -1;
     int32_t  next_probe_cap      = 1;
@@ -1366,6 +1371,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     uint64_t mtp_draft_cache_hits = 0;
     uint64_t mtp_draft_cache_tokens = 0;
     uint64_t mtp_engram_cache_hits = 0;
+    uint64_t mtp_profile_calls = 0;
+    int64_t mtp_profile_decode_us = 0;
+    int64_t mtp_profile_host_us = 0;
 
     std::vector<uint8_t> mtp_fr_allowed;
     uint64_t mtp_fr_queries = 0;
@@ -1374,6 +1382,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     uint64_t mtp_fr_blocked = 0;
     uint64_t mtp_fr_prompt_allowed = 0;
     std::vector<float> mtp_logit_bias;
+
+    struct mtp_frontier_selector {
+        uint32_t n_embd = 0;
+        uint32_t n_clusters = 0;
+        uint32_t n_vocab = 0;
+        std::vector<float> weight;
+        std::vector<float> bias;
+        std::vector<int32_t> cluster;
+
+        bool ready() const {
+            return n_embd > 0 && n_clusters > 0 && n_vocab > 0 &&
+                weight.size() == (size_t) n_embd * n_clusters &&
+                bias.size() == n_clusters && cluster.size() == n_vocab;
+        }
+    } mtp_frontier;
+
+    struct mtp_candidate_reranker {
+        int32_t depth = -1;
+        int32_t n_embd = 0;
+        int32_t rank = 0;
+        int32_t n_vocab = 0;
+        float scale = 1.0f;
+        std::vector<float> a;
+        std::vector<float> b;
+        std::vector<float> projected;
+
+        bool enabled_for(int32_t value) const {
+            return depth == value && !a.empty();
+        }
+    } mtp_reranker;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -1388,7 +1426,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
         init_mtp_fr_vocab();
+        init_mtp_frontier_selector();
         init_mtp_logit_bias();
+        init_mtp_candidate_reranker();
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -1420,8 +1460,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(
-                            mtp_fr_allowed.empty() ? 10 : std::max<int32_t>(10, (int32_t) this->params.mtp_fr_top_k)));
+                if (this->params.mtp_backend_greedy && mtp_fr_allowed.empty()) {
+                    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+                } else {
+                    llama_sampler_chain_add(chain, llama_sampler_init_top_k(
+                                mtp_fr_allowed.empty() ? 10 : std::max<int32_t>(10, (int32_t) this->params.mtp_fr_top_k)));
+                }
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1435,6 +1479,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const bool dump_draft_rows = !this->params.mtp_train_dump.empty() && this->params.mtp_train_dump_source == "draft";
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !dump_draft_rows);
+        if (this->params.mtp_backend_greedy) {
+            SPC_INF("%s", "MTP backend greedy sampling enabled; draft p-min stopping is bypassed\n");
+        }
+        if (!mtp_fr_allowed.empty() && this->params.backend_sampling) {
+            llama_tokens ids;
+            ids.reserve(mtp_fr_allowed.size());
+            for (size_t id = 0; id < mtp_fr_allowed.size(); ++id) {
+                if (mtp_fr_allowed[id]) {
+                    ids.push_back((llama_token) id);
+                }
+            }
+            const size_t n_dynamic = mtp_frontier.ready() ? 2048 : this->params.mtp_fr_dynamic;
+            if (n_dynamic == 0) {
+                throw std::runtime_error("--spec-mtp-fr-dynamic must be greater than zero");
+            }
+            llama_set_mtp_compact_vocab(ctx_dft, ids.data(), ids.size(), n_dynamic);
+            SPC_INF("MTP compact vocab enabled: static=%zu dynamic=%zu\n", ids.size(), n_dynamic);
+        }
         llama_set_mtp_hidden_lora_state(ctx_dft, this->params.mtp_lora_state);
 
         if (this->params.mtp_engram_layer_cache) {
@@ -1580,6 +1642,49 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 (int) params.mtp_fr_prompt_tokens, params.mtp_fr_prompt_context);
     }
 
+    void init_mtp_frontier_selector() {
+        if (params.mtp_frontier_selector.empty()) {
+            return;
+        }
+        if (mtp_fr_allowed.empty()) {
+            throw std::runtime_error("--spec-mtp-frontier-selector requires --spec-mtp-fr-vocab");
+        }
+
+        std::ifstream in(params.mtp_frontier_selector, std::ios::binary);
+        if (!in.is_open()) {
+            throw std::runtime_error("failed to open MTP frontier selector: " + params.mtp_frontier_selector);
+        }
+
+        std::array<char, 8> magic = {};
+        uint32_t n_embd_file = 0;
+        uint32_t n_clusters = 0;
+        uint32_t n_vocab = 0;
+        in.read(magic.data(), magic.size());
+        in.read((char *) &n_embd_file, sizeof(n_embd_file));
+        in.read((char *) &n_clusters, sizeof(n_clusters));
+        in.read((char *) &n_vocab, sizeof(n_vocab));
+        if (!in || std::memcmp(magic.data(), "MTPFRS1\0", magic.size()) != 0 ||
+                n_embd_file != (uint32_t) n_embd || n_vocab != mtp_fr_allowed.size() ||
+                n_clusters == 0 || n_clusters > 4096) {
+            throw std::runtime_error("invalid MTP frontier selector: " + params.mtp_frontier_selector);
+        }
+
+        mtp_frontier.n_embd = n_embd_file;
+        mtp_frontier.n_clusters = n_clusters;
+        mtp_frontier.n_vocab = n_vocab;
+        mtp_frontier.weight.resize((size_t) n_embd_file * n_clusters);
+        mtp_frontier.bias.resize(n_clusters);
+        mtp_frontier.cluster.resize(n_vocab);
+        in.read((char *) mtp_frontier.weight.data(), mtp_frontier.weight.size() * sizeof(float));
+        in.read((char *) mtp_frontier.bias.data(), mtp_frontier.bias.size() * sizeof(float));
+        in.read((char *) mtp_frontier.cluster.data(), mtp_frontier.cluster.size() * sizeof(int32_t));
+        if (!in || !mtp_frontier.ready()) {
+            throw std::runtime_error("truncated MTP frontier selector: " + params.mtp_frontier_selector);
+        }
+        SPC_INF("MTP frontier selector enabled: path='%s', clusters=%u\n",
+                params.mtp_frontier_selector.c_str(), n_clusters);
+    }
+
 
     void init_mtp_logit_bias() {
         if (params.mtp_logit_bias.empty()) {
@@ -1627,6 +1732,78 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         SPC_INF("MTP draft logit bias enabled: path='%s', rows=%" PRIu64 "\n",
                 params.mtp_logit_bias.c_str(), loaded);
     }
+
+    void init_mtp_candidate_reranker() {
+        if (params.mtp_candidate_reranker.empty()) {
+            return;
+        }
+        if (!mtp_fr_allowed.empty()) {
+            throw std::runtime_error("MTP candidate reranker cannot be combined with the FR vocabulary filter");
+        }
+
+        std::ifstream in(params.mtp_candidate_reranker, std::ios::binary);
+        if (!in.is_open()) {
+            throw std::runtime_error("failed to open MTP candidate reranker: " + params.mtp_candidate_reranker);
+        }
+
+        char magic[8] = {};
+        uint32_t version = 0;
+        uint32_t depth = 0;
+        uint32_t file_n_embd = 0;
+        uint32_t rank = 0;
+        uint32_t file_n_vocab = 0;
+        in.read(magic, sizeof(magic));
+        in.read(reinterpret_cast<char *>(&version), sizeof(version));
+        in.read(reinterpret_cast<char *>(&depth), sizeof(depth));
+        in.read(reinterpret_cast<char *>(&file_n_embd), sizeof(file_n_embd));
+        in.read(reinterpret_cast<char *>(&rank), sizeof(rank));
+        in.read(reinterpret_cast<char *>(&file_n_vocab), sizeof(file_n_vocab));
+
+        const int32_t model_n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(params.ctx_dft)));
+        if (!in.good() || std::memcmp(magic, "MTPRER1\0", 8) != 0 || version != 1 ||
+                depth >= 3 || file_n_embd != (uint32_t) n_embd || file_n_vocab != (uint32_t) model_n_vocab ||
+                rank == 0 || rank > 1024) {
+            throw std::runtime_error("incompatible MTP candidate reranker: " + params.mtp_candidate_reranker);
+        }
+
+        mtp_reranker.depth = (int32_t) depth;
+        mtp_reranker.n_embd = (int32_t) file_n_embd;
+        mtp_reranker.rank = (int32_t) rank;
+        mtp_reranker.n_vocab = (int32_t) file_n_vocab;
+        mtp_reranker.scale = params.mtp_candidate_reranker_scale;
+        mtp_reranker.a.resize((size_t) rank * file_n_embd);
+        mtp_reranker.b.resize((size_t) file_n_vocab * rank);
+        mtp_reranker.projected.resize(rank);
+        in.read(reinterpret_cast<char *>(mtp_reranker.a.data()), mtp_reranker.a.size() * sizeof(float));
+        in.read(reinterpret_cast<char *>(mtp_reranker.b.data()), mtp_reranker.b.size() * sizeof(float));
+        if (!in.good()) {
+            throw std::runtime_error("truncated MTP candidate reranker: " + params.mtp_candidate_reranker);
+        }
+
+        SPC_INF("MTP candidate reranker enabled: path='%s', depth=%d, rank=%d, scale=%.3f\n",
+                params.mtp_candidate_reranker.c_str(), mtp_reranker.depth + 1,
+                mtp_reranker.rank, mtp_reranker.scale);
+    }
+
+    void project_mtp_candidate_reranker(const float * h) {
+        for (int32_t r = 0; r < mtp_reranker.rank; ++r) {
+            const float * row = mtp_reranker.a.data() + (size_t) r * mtp_reranker.n_embd;
+            float value = 0.0f;
+            for (int32_t j = 0; j < mtp_reranker.n_embd; ++j) {
+                value += row[j] * h[j];
+            }
+            mtp_reranker.projected[(size_t) r] = value;
+        }
+    }
+
+    float score_mtp_candidate_reranker(llama_token id) const {
+        const float * row = mtp_reranker.b.data() + (size_t) id * mtp_reranker.rank;
+        float value = 0.0f;
+        for (int32_t r = 0; r < mtp_reranker.rank; ++r) {
+            value += mtp_reranker.projected[(size_t) r] * row[r];
+        }
+        return mtp_reranker.scale * value / std::sqrt((float) mtp_reranker.rank);
+    }
     bool mtp_fr_prompt_has_token(const common_speculative_draft_params & dp, llama_token id) const {
         if (!params.mtp_fr_prompt_tokens || dp.prompt == nullptr || params.mtp_fr_prompt_context == 0) {
             return false;
@@ -1647,6 +1824,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (mtp_fr_allowed.empty()) {
             return true;
         }
+        // The compact head already limits candidates to static plus selected frontier rows.
+        if (mtp_frontier.ready()) {
+            if (allowed_by_prompt) {
+                *allowed_by_prompt = false;
+            }
+            return true;
+        }
         if (id >= 0 && (size_t) id < mtp_fr_allowed.size() && mtp_fr_allowed[(size_t) id]) {
             if (allowed_by_prompt) {
                 *allowed_by_prompt = false;
@@ -1665,15 +1849,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     llama_token mtp_fr_select_candidate(
             const common_speculative_draft_params & dp,
             const llama_token_data_array * cur_p,
-            float & p_selected) {
+            float & p_selected,
+            const float * h,
+            int32_t depth) {
         if (cur_p == nullptr || cur_p->size <= 0) {
             p_selected = 0.0f;
             return LLAMA_TOKEN_NULL;
         }
 
-        if (mtp_fr_allowed.empty() && mtp_logit_bias.empty()) {
+        const bool rerank = h != nullptr && mtp_reranker.enabled_for(depth);
+        if (mtp_fr_allowed.empty() && mtp_logit_bias.empty() && !rerank) {
             p_selected = cur_p->data[0].p;
             return cur_p->data[0].id;
+        }
+
+        if (rerank) {
+            project_mtp_candidate_reranker(h);
         }
 
         if (!mtp_fr_allowed.empty()) {
@@ -1686,7 +1877,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         size_t best_k = 0;
         bool best_allowed_by_prompt = false;
 
-        for (size_t k = 0; k < cur_p->size; ++k) {
+        const size_t n_candidates = rerank ? std::min<size_t>(8, cur_p->size) : cur_p->size;
+        for (size_t k = 0; k < n_candidates; ++k) {
             bool allowed_by_prompt = false;
             const llama_token id = cur_p->data[k].id;
             if (!mtp_fr_token_allowed(dp, id, &allowed_by_prompt)) {
@@ -1697,6 +1889,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             double score = std::log((double) std::max(p, 1.0e-9f));
             if (id >= 0 && (size_t) id < mtp_logit_bias.size()) {
                 score += mtp_logit_bias[(size_t) id];
+            }
+            if (rerank && id >= 0 && id < mtp_reranker.n_vocab) {
+                score += score_mtp_candidate_reranker(id);
             }
 
             if (best_id == LLAMA_TOKEN_NULL || score > best_score) {
@@ -2025,6 +2220,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         mtp_dump.write(reinterpret_cast<const char *>(&value), sizeof(value));
     }
 
+    template <typename T>
+    void mtp_teacher_dump_write_scalar(const T & value) {
+        mtp_teacher_dump.write(reinterpret_cast<const char *>(&value), sizeof(value));
+    }
+
     void init_mtp_loras() {
         auto * ctx_dft = params.ctx_dft;
         if (ctx_dft == nullptr) {
@@ -2347,6 +2547,84 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    void init_mtp_train_teacher_dump() {
+        if (params.mtp_train_teacher_dump.empty()) {
+            return;
+        }
+        if (params.mtp_train_teacher_top_k <= 0 || !mtp_dump.is_open()) {
+            SPC_WRN("%s", "MTP teacher dump requires --spec-mtp-dump and --spec-mtp-teacher-top-k > 0\n");
+            mtp_dump.close();
+            mtp_dump_finished = true;
+            mtp_teacher_dump_finished = true;
+            return;
+        }
+
+        const char magic[8] = { 'M', 'T', 'P', 'T', 'C', 'H', '1', '\0' };
+        const uint32_t version = 1;
+        const uint32_t n_vocab = (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(params.ctx_tgt)));
+        const uint32_t top_k = (uint32_t) params.mtp_train_teacher_top_k;
+        const uint32_t record_bytes = 2u * top_k * sizeof(uint32_t);
+        const uint32_t header_bytes = 32;
+
+        if (params.mtp_train_dump_append) {
+            std::ifstream in(params.mtp_train_teacher_dump, std::ios::binary | std::ios::ate);
+            if (in.is_open()) {
+                const std::streamoff size = in.tellg();
+                in.seekg(0, std::ios::beg);
+                char file_magic[8] = {};
+                uint32_t file_version = 0, file_vocab = 0, file_top_k = 0, file_record_bytes = 0;
+                uint64_t file_limit = 0;
+                in.read(file_magic, sizeof(file_magic));
+                const bool header_ok = in.good() &&
+                    mtp_dump_read_scalar(in, file_version) && mtp_dump_read_scalar(in, file_vocab) &&
+                    mtp_dump_read_scalar(in, file_top_k) && mtp_dump_read_scalar(in, file_record_bytes) &&
+                    mtp_dump_read_scalar(in, file_limit);
+                const uint64_t payload = size >= (std::streamoff) header_bytes ? (uint64_t) size - header_bytes : 0;
+                const uint64_t records = record_bytes > 0 ? payload / record_bytes : 0;
+                if (header_ok && size >= (std::streamoff) header_bytes &&
+                        std::memcmp(file_magic, magic, sizeof(magic)) == 0 && file_version == version &&
+                        file_vocab == n_vocab && file_top_k == top_k && file_record_bytes == record_bytes &&
+                        payload % record_bytes == 0 && records == mtp_dump_records) {
+                    mtp_teacher_dump.open(params.mtp_train_teacher_dump, std::ios::binary | std::ios::in | std::ios::out);
+                    if (mtp_teacher_dump.is_open()) {
+                        mtp_teacher_dump.seekp(24, std::ios::beg);
+                        mtp_teacher_dump_write_scalar(params.mtp_train_dump_limit);
+                        mtp_teacher_dump.seekp(0, std::ios::end);
+                    }
+                }
+            }
+        }
+
+        if (!mtp_teacher_dump.is_open()) {
+            if (params.mtp_train_dump_append) {
+                SPC_WRN("refusing to append unaligned MTP teacher dump '%s'\n", params.mtp_train_teacher_dump.c_str());
+                mtp_dump.close();
+                mtp_dump_finished = true;
+                mtp_teacher_dump_finished = true;
+                return;
+            }
+            mtp_teacher_dump.open(params.mtp_train_teacher_dump, std::ios::binary | std::ios::out | std::ios::trunc);
+            if (mtp_teacher_dump.is_open()) {
+                mtp_teacher_dump.write(magic, sizeof(magic));
+                mtp_teacher_dump_write_scalar(version);
+                mtp_teacher_dump_write_scalar(n_vocab);
+                mtp_teacher_dump_write_scalar(top_k);
+                mtp_teacher_dump_write_scalar(record_bytes);
+                mtp_teacher_dump_write_scalar(params.mtp_train_dump_limit);
+            }
+        }
+        if (!mtp_teacher_dump.good()) {
+            SPC_WRN("failed to prepare MTP teacher dump '%s'\n", params.mtp_train_teacher_dump.c_str());
+            mtp_teacher_dump.close();
+            mtp_teacher_dump_finished = true;
+            mtp_dump.close();
+            mtp_dump_finished = true;
+            return;
+        }
+        SPC_INF("MTP teacher dump enabled: path='%s', top_k=%u, aligned_records=%" PRIu64 "\n",
+                params.mtp_train_teacher_dump.c_str(), top_k, mtp_dump_records);
+    }
+
     void init_mtp_train_dump() {
         if (params.mtp_train_dump.empty()) {
             return;
@@ -2362,6 +2640,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (params.mtp_train_dump_append &&
                 init_mtp_train_dump_append(magic, version, format_q8_row_scale, n_labels, record_meta_bytes)) {
+            if (!mtp_dump_finished) {
+                init_mtp_train_teacher_dump();
+            }
             return;
         }
 
@@ -2389,6 +2670,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         SPC_INF("MTP training dump enabled: path='%s', source=%s, n_embd=%d, format=q8_row_scale, limit=%" PRIu64 "\n",
                 params.mtp_train_dump.c_str(), params.mtp_train_dump_source.c_str(), n_embd, params.mtp_train_dump_limit);
+        init_mtp_train_teacher_dump();
     }
 
     void finish_mtp_train_dump_if_needed() {
@@ -2399,7 +2681,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             SPC_INF("MTP training dump reached limit: records=%" PRIu64 ", path='%s'\n",
                     mtp_dump_records, params.mtp_train_dump.c_str());
             mtp_dump.close();
+            if (mtp_teacher_dump.is_open()) {
+                mtp_teacher_dump.close();
+            }
             mtp_dump_finished = true;
+            mtp_teacher_dump_finished = true;
         }
     }
 
@@ -2800,12 +3086,54 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         finish_mtp_state_dump_if_needed();
     }
 
+    bool write_mtp_teacher_record(llama_context * ctx_tgt, int32_t logits_idx) {
+        if (!mtp_teacher_dump.is_open() || mtp_teacher_dump_finished) {
+            return params.mtp_train_teacher_dump.empty();
+        }
+
+        const int32_t n_logits = llama_get_sampled_logits_count_ith(ctx_tgt, logits_idx);
+        const int32_t top_k = params.mtp_train_teacher_top_k;
+        const float * logits = llama_get_logits_ith(ctx_tgt, logits_idx);
+        const llama_token * ids = llama_get_sampled_candidates_ith(ctx_tgt, logits_idx);
+        if (logits == nullptr || n_logits < top_k) {
+            SPC_WRN("MTP teacher logits unavailable: row=%d count=%d requested=%d\n", logits_idx, n_logits, top_k);
+            mtp_teacher_dump.close();
+            mtp_teacher_dump_finished = true;
+            return false;
+        }
+
+        mtp_teacher_candidates.resize((size_t) n_logits);
+        for (int32_t i = 0; i < n_logits; ++i) {
+            mtp_teacher_candidates[(size_t) i] = { ids == nullptr ? i : ids[i], logits[i], 0.0f };
+        }
+        std::partial_sort(mtp_teacher_candidates.begin(), mtp_teacher_candidates.begin() + top_k,
+                mtp_teacher_candidates.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                    return a.logit > b.logit;
+                });
+        for (int32_t i = 0; i < top_k; ++i) {
+            mtp_teacher_dump_write_scalar((int32_t) mtp_teacher_candidates[(size_t) i].id);
+        }
+        for (int32_t i = 0; i < top_k; ++i) {
+            mtp_teacher_dump_write_scalar(mtp_teacher_candidates[(size_t) i].logit);
+        }
+        if (!mtp_teacher_dump.good()) {
+            SPC_WRN("failed while writing MTP teacher dump '%s' after %" PRIu64 " records\n",
+                    params.mtp_train_teacher_dump.c_str(), mtp_dump_records);
+            mtp_teacher_dump.close();
+            mtp_teacher_dump_finished = true;
+            return false;
+        }
+        return true;
+    }
+
     void write_mtp_train_record(
             llama_seq_id seq_id,
             llama_pos pos,
             llama_token token,
             const llama_token labels[3],
-            const float * h) {
+            const float * h,
+            llama_context * ctx_tgt,
+            int32_t logits_idx) {
         if (!mtp_dump.is_open() || mtp_dump_finished) {
             return;
         }
@@ -2825,6 +3153,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const float scaled = h[i] / scale;
             const int q = std::max(-127, std::min(127, (int) std::lround(scaled)));
             mtp_dump_q8[i] = (int8_t) q;
+        }
+
+        if (!write_mtp_teacher_record(ctx_tgt, logits_idx)) {
+            mtp_dump.close();
+            mtp_dump_finished = true;
+            return;
         }
 
         mtp_dump_write_scalar((int32_t) seq_id);
@@ -2861,7 +3195,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 batch_in.token[k + 3],
             };
             const float * h = verify_h[seq_id].data() + (size_t) i * n_embd;
-            write_mtp_train_record(seq_id, batch_in.pos[k], batch_in.token[k], labels, h);
+            write_mtp_train_record(seq_id, batch_in.pos[k], batch_in.token[k], labels, h, params.ctx_tgt, k);
         }
     }
 
@@ -2883,7 +3217,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 batch_in.token[k + 3],
             };
             const float * h = llama_get_embeddings_nextn_ith(ctx_dft, k);
-            write_mtp_train_record(seq_id, batch_in.pos[k], batch_in.token[k], labels, h);
+            write_mtp_train_record(seq_id, batch_in.pos[k], batch_in.token[k], labels, h, params.ctx_tgt, k);
         }
     }
 
@@ -3117,6 +3451,94 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         ++score.samples;
     }
 
+    void update_mtp_compact_prompt_vocab(const common_speculative_draft_params_vec & dparams) {
+        if (mtp_fr_allowed.empty() || !params.mtp_fr_prompt_tokens || mtp_frontier.ready()) {
+            return;
+        }
+
+        llama_tokens ids;
+        const size_t n_dynamic = params.mtp_fr_dynamic;
+        ids.reserve(n_dynamic);
+        std::unordered_set<llama_token> seen;
+        for (const auto & dp : dparams) {
+            if (!dp.drafting || dp.prompt == nullptr) {
+                continue;
+            }
+            const auto & prompt = *dp.prompt;
+            const size_t begin = prompt.size() > params.mtp_fr_prompt_context ? prompt.size() - params.mtp_fr_prompt_context : 0;
+            for (size_t i = prompt.size(); i > begin && ids.size() < n_dynamic; --i) {
+                const llama_token id = prompt[i - 1];
+                if (id >= 0 && (size_t) id < mtp_fr_allowed.size() && !mtp_fr_allowed[(size_t) id] && seen.insert(id).second) {
+                    ids.push_back(id);
+                }
+            }
+        }
+        while (ids.size() < n_dynamic) {
+            ids.push_back(0);
+        }
+        llama_update_mtp_compact_vocab(params.ctx_dft, ids.data(), ids.size());
+    }
+
+    void update_mtp_compact_frontier_vocab(const common_speculative_draft_params_vec & dparams) {
+        if (!mtp_frontier.ready()) {
+            return;
+        }
+
+        const float * h = nullptr;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (dparams[seq_id].drafting) {
+                h = pending_h[seq_id].data();
+                break;
+            }
+        }
+        if (h == nullptr) {
+            return;
+        }
+
+        uint32_t selected_cluster = 0;
+        float best_score = -INFINITY;
+        for (uint32_t c = 0; c < mtp_frontier.n_clusters; ++c) {
+            const float * weight = mtp_frontier.weight.data() + (size_t) c * n_embd;
+            float score = mtp_frontier.bias[c];
+            for (int32_t j = 0; j < n_embd; ++j) {
+                score += weight[j] * h[j];
+            }
+            if (score > best_score) {
+                best_score = score;
+                selected_cluster = c;
+            }
+        }
+
+        constexpr size_t n_dynamic = 2048;
+        llama_tokens ids;
+        ids.reserve(n_dynamic);
+        std::unordered_set<llama_token> seen;
+        for (size_t id = 0; id < mtp_frontier.cluster.size() && ids.size() < n_dynamic; ++id) {
+            if (mtp_frontier.cluster[id] == (int32_t) selected_cluster && !mtp_fr_allowed[id] && seen.insert((llama_token) id).second) {
+                ids.push_back((llama_token) id);
+            }
+        }
+        if (params.mtp_fr_prompt_tokens) {
+            for (const auto & dp : dparams) {
+                if (!dp.drafting || dp.prompt == nullptr) {
+                    continue;
+                }
+                const auto & prompt = *dp.prompt;
+                const size_t begin = prompt.size() > params.mtp_fr_prompt_context ? prompt.size() - params.mtp_fr_prompt_context : 0;
+                for (size_t i = prompt.size(); i > begin && ids.size() < n_dynamic; --i) {
+                    const llama_token id = prompt[i - 1];
+                    if (id >= 0 && (size_t) id < mtp_fr_allowed.size() && !mtp_fr_allowed[(size_t) id] && seen.insert(id).second) {
+                        ids.push_back(id);
+                    }
+                }
+            }
+        }
+        while (ids.size() < n_dynamic) {
+            ids.push_back(0);
+        }
+        llama_update_mtp_compact_vocab(params.ctx_dft, ids.data(), ids.size());
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
         const int64_t t_start_us = ggml_time_us();
@@ -3144,6 +3566,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     cap_scores.size() > 3 ? cap_scores[3].samples : 0);
             n_max_adaptive_last = n_max_eff;
         }
+
+        update_mtp_compact_frontier_vocab(dparams);
+        update_mtp_compact_prompt_vocab(dparams);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -3200,7 +3625,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             set_mtp_lora_depth(i);
+            const int64_t t_decode_begin = ggml_time_us();
             int ret = llama_decode(ctx_dft, batch);
+            mtp_profile_decode_us += ggml_time_us() - t_decode_begin;
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
@@ -3217,29 +3644,51 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 auto * smpl = smpls[seq_id].get();
+                const int64_t t_host_begin = ggml_time_us();
+                const bool use_backend_greedy = this->params.mtp_backend_greedy && mtp_fr_allowed.empty() &&
+                    mtp_logit_bias.empty() && !mtp_reranker.enabled_for(i);
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                llama_token id = LLAMA_TOKEN_NULL;
+                float p_draft = 0.0f;
+                const llama_token_data_array * cur_p = nullptr;
+                if (use_backend_greedy) {
+                    llama_synchronize(ctx_dft);
+                    id = llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]);
+                    p_draft = id == LLAMA_TOKEN_NULL ? 0.0f : 1.0f;
+                } else {
+                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                    cur_p = common_sampler_get_candidates(smpl, true);
+                }
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                if (cur_p) {
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
                 }
 
                 auto & dp = dparams.at(seq_id);
 
-                float p_draft = 0.0f;
-                const llama_token id = mtp_fr_select_candidate(dp, cur_p, p_draft);
-                maybe_log_mtp_fr_stats();
+                if (!use_backend_greedy) {
+                    id = mtp_fr_select_candidate(dp, cur_p, p_draft, h_row, i);
+                    maybe_log_mtp_fr_stats();
+                }
+                mtp_profile_host_us += ggml_time_us() - t_host_begin;
+                ++mtp_profile_calls;
+                if (this->params.mtp_profile && mtp_profile_calls % 1024 == 0) {
+                    SPC_INF("MTP profile: calls=%" PRIu64 ", decode=%.3f ms/call, host=%.3f ms/call\n",
+                            mtp_profile_calls,
+                            (double) mtp_profile_decode_us / (1000.0 * mtp_profile_calls),
+                            (double) mtp_profile_host_us / (1000.0 * mtp_profile_calls));
+                }
 
                 // only collect sufficiently confident draft tokens
                 if (id == LLAMA_TOKEN_NULL || p_draft < params.p_min) {
                     const llama_token prev_token = dp.result->empty() ? dp.id_last : dp.result->back();
-                    const llama_token top_id = cur_p->size > 0 ? cur_p->data[0].id : LLAMA_TOKEN_NULL;
-                    const float top_p = cur_p->size > 0 && std::isfinite(cur_p->data[0].p) ? cur_p->data[0].p : p_draft;
+                    const llama_token top_id = cur_p && cur_p->size > 0 ? cur_p->data[0].id : id;
+                    const float top_p = cur_p && cur_p->size > 0 && std::isfinite(cur_p->data[0].p) ? cur_p->data[0].p : p_draft;
                     const float * h_in = seq_id >= 0 && seq_id < (llama_seq_id) mtp_draft_input_h.size()
                         ? mtp_draft_input_h[seq_id].data()
                         : nullptr;
@@ -3379,6 +3828,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool need_embd_nextn() const override {
         return true;
     }
+
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
