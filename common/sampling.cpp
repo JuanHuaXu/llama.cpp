@@ -691,9 +691,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         trace->reserve(idxs.size());
     }
 
+    // Draft top-k substitution reads the sampler frontier after sampling. With
+    // grammar rejection sampling that frontier is otherwise unconstrained, so
+    // filter it first before a draft token can be accepted from it.
+    const bool filter_draft_frontier_with_grammar = grammar_first || draft_accept_top_k > 0;
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id_sampled = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id_sampled = common_sampler_sample(gsmpl, ctx, idxs[i], filter_draft_frontier_with_grammar);
         const llama_token id = common_sampler_maybe_accept_draft_candidate(
                 gsmpl, id_sampled, draft[i], draft_accept_top_k, draft_accept_p_min);
         common_sampler_append_accept_trace(gsmpl, id, trace);
@@ -708,7 +713,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], filter_draft_frontier_with_grammar);
         common_sampler_append_accept_trace(gsmpl, id, trace);
 
         common_sampler_accept(gsmpl, id, true);
